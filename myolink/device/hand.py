@@ -4,6 +4,7 @@ import asyncio
 import struct
 import logging
 from typing import List, Optional, Tuple
+from enum import Enum
 
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
@@ -18,6 +19,7 @@ CONTROL_CHARACTERISTIC_UUID = "0B0B4102-FEED-DEAD-BEE5-0BE9B1091C50"
 
 # Command IDs
 CMD_SET_DIGIT_POSITIONS = 0x06
+CMD_SET_GRIP = 0x07
 
 # Digit IDs (assuming standard order)
 DIGIT_THUMB = 0x00
@@ -30,6 +32,16 @@ DIGIT_IDS = [DIGIT_THUMB, DIGIT_INDEX, DIGIT_MIDDLE, DIGIT_RING, DIGIT_PINKY]
 
 # Control Schema Version
 SCHEMA_VERSION = 0x00
+
+# Grip Types Enum
+class GripType(Enum):
+	RELAX = 0x00
+	POINT = 0x01
+	HOOK = 0x02
+	PINCH = 0x03
+	CYLINDRICAL = 0x04
+	TRIPOD = 0x05
+	# Add other standard grips as needed
 
 class Hand:
 	"""A class to interact with an Open Bionics Hand."""
@@ -120,7 +132,6 @@ class Hand:
 
 		# Prepare payload only for the provided digits
 		payload = bytearray()
-		payload.append(0x01) # Set Digit Positions Subcommand
 		num_digits_to_set = len(clamped_positions)
 		for i in range(num_digits_to_set):
 			digit_id = DIGIT_IDS[i] # Get corresponding digit ID
@@ -133,12 +144,44 @@ class Hand:
 
 		# Construct final command
 		# Schema | Command ID | Is Request | Data Length | Payload
-		command = struct.pack("<BBBB", SCHEMA_VERSION, CMD_SET_DIGIT_POSITIONS, 0x01, data_length) + payload
+		command = struct.pack(">BBBB", SCHEMA_VERSION, CMD_SET_DIGIT_POSITIONS, 0x01, data_length) + payload
 
 		logger.debug(f"Sending Set Digit Positions command: {command.hex()}")
 		try:
 			await self._client.write_gatt_char(CONTROL_CHARACTERISTIC_UUID, command, response=False)
 			logger.info(f"Sent Set Digit Positions command to {self.name} ({self.address})")
+		except BleakError as e:
+			logger.error(f"Failed to send command: {e}")
+		except Exception as e:
+			logger.error(f"An unexpected error occurred while sending command: {e}")
+
+	async def set_grip(self, grip: GripType):
+		"""Sets the hand to a predefined grip.
+
+		Args:
+			grip: The GripType enum value representing the desired grip.
+		"""
+		if not (self._client and self._client.is_connected):
+			logger.error("Cannot send command: Not connected.")
+			return
+
+		if not isinstance(grip, GripType):
+			logger.error(f"Invalid grip type: {grip}. Must be a GripType enum member.")
+			return
+
+		# Payload for Set Grip (Schema 0) is just the grip ID byte
+		grip_id = grip.value
+		payload = bytes([grip_id])
+		data_length = len(payload)
+
+		# Construct final command
+		# Schema | Command ID | Is Request | Data Length | Payload
+		command = struct.pack(">BBBB", SCHEMA_VERSION, CMD_SET_GRIP, 0x01, data_length) + payload
+
+		logger.debug(f"Sending Set Grip command: {command.hex()}")
+		try:
+			await self._client.write_gatt_char(CONTROL_CHARACTERISTIC_UUID, command, response=False)
+			logger.info(f"Sent Set Grip ({grip.name}) command to {self.name} ({self.address})")
 		except BleakError as e:
 			logger.error(f"Failed to send command: {e}")
 		except Exception as e:
