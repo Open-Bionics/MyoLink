@@ -1,63 +1,62 @@
-"""Example: Connect to a Hand and control individual digit positions."""
+"""Example: Discover and control OB2 Hand digits."""
 
 import asyncio
-import sys
 import logging
+import sys
+import os
+import time # Added
 
 # Add project root to path if running script directly
-import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from myolink import discover_devices, Hand # type: ignore
-from bleak.backends.device import BLEDevice
+from bleak import BleakClient
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO)
+from myolink import discover_devices, DeviceType, Hand, GripType # type: ignore
+
+# Configure logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-async def select_device(prompt: str = "Select a device:") -> BLEDevice:
-	"""Scans for devices and prompts the user to select one."""
-	print("Scanning for devices...")
-	discovered_devices = await discover_devices(timeout=5.0)
-
-	if 0 == len(discovered_devices):
-		print("No devices found. Make sure your device is powered on and advertising.")
-		sys.exit(1)
-
-	print("\nDiscovered devices:")
-	for i, device in enumerate(discovered_devices):
-		print(f"  {i + 1}. {device.name} ({device.address})")
-
-	print("\nNote: Ensure the selected device is paired with your OS for a stable connection.")
-
-	while True:
-		try:
-			selection = int(input(f"\n{prompt} (Enter number): "))
-			if 1 <= selection <= len(discovered_devices):
-				return discovered_devices[selection - 1]
-			else:
-				print("Invalid selection. Please try again.")
-		except ValueError:
-			print("Invalid input. Please enter a number.")
-		except KeyboardInterrupt:
-			print("\nOperation cancelled by user.")
-			sys.exit(0)
-
 async def main():
-	try:
-		selected_ble_device = await select_device("Select the Hand to control:")
-		hand = Hand(selected_ble_device)
+	hand_device = None
+	hand_ad_data = None
+	logger.info("Scanning for Open Bionics Hands (OB2 Hand)...")
 
-		print(f"\nConnecting to {hand.name} ({hand.address})...")
-		async with hand:
-			if not (hand._client and hand._client.is_connected):
-				print(f"Failed to connect to {hand.name}. Exiting.")
-				return
+	# Use the core discover_devices, filtering for OB2_HAND
+	discovered_hands = await discover_devices(timeout=5.0, device_type=DeviceType.OB2_HAND)
 
-			print(f"Successfully connected to {hand.name}.")
-			print("Enter 5 digit positions (thumb, index, middle, ring, pinky) as floats between 0.0 and 1.0, separated by commas or spaces.")
-			print("Examples: 0.5, 0.0, 1.0, 0.2, 0.8  OR  0.5 0.0 1.0 0.2 0.8")
-			print("Type 'q' or press Ctrl+C to quit.")
+	if not discovered_hands:
+		logger.error("No OB2 Hand devices found.")
+		return
+
+	# Select the first discovered hand
+	first_hand_info = list(discovered_hands.values())[0]
+	hand_device, hand_ad_data, rssi = first_hand_info
+
+	logger.info(f"Found Hand: {hand_device.address} ({hand_device.name}), RSSI: {rssi}")
+	if hand_ad_data:
+		 logger.info(f"  Details: Schema={hand_ad_data.schema_version}, "
+					 f"Batt={hand_ad_data.battery_level}%, "
+					 f"Config={hand_ad_data.device_config}, "
+					 f"Specifics={hand_ad_data.device_specific_data}")
+
+	logger.info(f"Connecting to {hand_device.address}...")
+	async with BleakClient(hand_device) as client:
+		if not client.is_connected:
+			logger.error(f"Failed to connect to {hand_device.address}")
+			return
+
+		logger.info("Connected successfully.")
+		# Instantiate Hand class with the connected client
+		hand = Hand(client)
+
+		try:
+			logger.info("--- Interactive Digit Control ---")
+			logger.info("Enter 1 to 5 digit positions (thumb, index, middle, ring, pinky)")
+			logger.info("as floats between 0.0 and 1.0, separated by commas or spaces.")
+			logger.info("Examples: 0.5, 0.2, 0.1  OR  0.8 1.0")
+			logger.info("Type 'q' or press Ctrl+C to quit.")
 
 			while True:
 				try:
@@ -65,7 +64,7 @@ async def main():
 					if 'q' == user_input:
 						break
 
-					# Replace commas with spaces, then split by whitespace
+					# Replace commas with spaces, then split
 					parts = user_input.replace(',', ' ').split()
 
 					# Allow 1 to 5 values
@@ -74,39 +73,37 @@ async def main():
 						continue
 
 					try:
-						positions = [float(p) for p in parts]
-						# Basic validation (more detailed validation is in the Hand class)
-						if any(p < 0.0 or p > 1.0 for p in positions):
-							print("Invalid input: Positions must be between 0.0 and 1.0.")
-							continue
+						positions_list = [float(p) for p in parts]
 
-						await hand.set_digit_positions(positions)
-						print(f"Sent positions: {positions}")
+						# Convert list to dictionary {digit_id: position}
+						positions_dict = {i: pos for i, pos in enumerate(positions_list)}
+
+						await hand.set_digit_positions(positions_dict)
+						logger.info(f"Sent positions: {positions_dict}")
 
 					except ValueError:
-						print("Invalid input: Please ensure all values are valid numbers.")
+						print("Invalid input: Please ensure all values are valid numbers between 0.0 and 1.0.")
 						continue
+					except Exception as cmd_e:
+						logger.error(f"Error sending command: {cmd_e}")
+						continue # Allow user to try again
 
-				except asyncio.CancelledError:
-					# Likely caused by KeyboardInterrupt during an await operation within the loop
-					logger.info("Operation cancelled, proceeding to disconnect.")
 				except KeyboardInterrupt:
-					print("\nOperation cancelled by user.")
+					logger.info("\nLoop interrupted by user.")
 					break
-				except Exception as e:
-					logger.error(f"An error occurred while sending command: {e}")
-					# Allow loop to continue or break depending on severity? For now, continue.
-					continue
 
-	except asyncio.CancelledError:
-		# Likely caused by KeyboardInterrupt during an await operation within the loop
-		logger.info("Operation cancelled, proceeding to disconnect.")
-	except KeyboardInterrupt:
-		print("\nOperation cancelled by user.")
-	except Exception as e:
-		logger.error(f"An unexpected error occurred: {e}")
-	finally:
-		print("Exiting application.")
+		except Exception as e:
+			logger.error(f"An error occurred during hand control: {e}", exc_info=True)
+		finally:
+			logger.info("Disconnecting...")
+			# Disconnect happens automatically when exiting BleakClient context
+
+	logger.info("Hand control example finished.")
 
 if __name__ == "__main__":
-	asyncio.run(main()) 
+	try:
+		asyncio.run(main())
+	except KeyboardInterrupt:
+		logger.info("Program interrupted by user.")
+	except Exception as e:
+		logger.error(f"An unexpected error occurred: {e}", exc_info=True) 

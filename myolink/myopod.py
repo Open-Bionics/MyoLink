@@ -6,25 +6,25 @@ import logging
 import struct # Added for packing data
 
 # --- Service UUIDs ---
-DATA_STREAMING_SERVICE_UUID = "0B0B3000-FEED-DEAD-BEE5-08E9B1091C50" # Corrected per user
-CONTROL_SERVICE_UUID = "0B0B4000-FEED-DEAD-BEE5-0BE9B1091C50" # Added per user info
+DATA_STREAMING_SERVICE_UUID = "0B0B3000-FEED-DEAD-BEE5-08E9B1091C50"
+# CONTROL_SERVICE_UUID = "0B0B4000-FEED-DEAD-BEE5-0BE9B1091C50" # No longer needed for MyoPod stream control
 # Add other service UUIDs (Battery, Settings, etc.) as needed
 
 # --- Characteristic UUIDs ---
 # Data Streaming Service Chars
-READ_ONLY_CONFIG_CHAR_UUID = "0B0B3100-FEED-DEAD-BEE5-0BE9B1091C50" # Added per user info (assuming prefix)
-DATA_STREAM_CONFIG_CHAR_UUID = "0B0B3101-FEED-DEAD-BEE5-0BE9B1091C50" # Was MYOPOD_CONTROL_POINT_UUID
-DATA_STREAM_CHAR_UUID = "0B0B3102-FEED-DEAD-BEE5-0BE9B1091C50"      # Was MYOPOD_DATA_UUID
+READ_ONLY_CONFIG_CHAR_UUID = "0B0B3100-FEED-DEAD-BEE5-0BE9B1091C50"
+DATA_STREAM_CONFIG_CHAR_UUID = "0B0B3101-FEED-DEAD-BEE5-0BE9B1091C50"
+DATA_STREAM_CHAR_UUID = "0B0B3102-FEED-DEAD-BEE5-0BE9B1091C50"
 
 # Control Service Chars
-CONTROL_COMMANDS_CHAR_UUID = "0B0B4102-FEED-DEAD-BEE5-0BE9B1091C50" # Added per user info (assuming prefix)
+# CONTROL_COMMANDS_CHAR_UUID = "0B0B4102-FEED-DEAD-BEE5-0BE9B1091C50" # No longer needed for MyoPod stream control
 
 # --- Schema Versions & Constants ---
 READ_ONLY_CONFIG_SCHEMA_VERSION = 0x00
 DATA_STREAM_CONFIG_SCHEMA_VERSION = 0x00
-DATA_STREAM_SCHEMA_VERSION = 0x00 # Schema for 0x3102 notifications
-CONTROL_COMMAND_SCHEMA_VERSION = 0x00
-CONTROL_CMD_STATUS_IS_REQUEST = 0b00000001 # Bit 0 set
+DATA_STREAM_SCHEMA_VERSION = 0x00
+# CONTROL_COMMAND_SCHEMA_VERSION = 0x00 # No longer needed
+# CONTROL_CMD_STATUS_IS_REQUEST = 0b00000001 # No longer needed
 
 # --- Active Stream Types (Upper Nibble of Config Byte) ---
 # From section 9.2.2.4.1
@@ -46,10 +46,9 @@ COMPRESSION_BYTE_PACK = 0x02 # 4x 12-bit signed int -> 6 bytes
 COMPRESSION_RES_LIMIT = 0x03 # 8-bit signed int (MSB)
 # Values 4-15 reserved/N/A
 
-# --- Placeholder Control Command Codes --- MUST BE REPLACED
-# Control Command Codes (for Control Service 0x4102)
-CMD_CODE_START_STREAM = 0xAA # Replace with actual command code
-CMD_CODE_STOP_STREAM = 0xBB  # Replace with actual command code
+# --- Placeholder Control Command Codes --- (REMOVED)
+# CMD_CODE_START_STREAM = 0xAA
+# CMD_CODE_STOP_STREAM = 0xBB
 
 # --- Stream Type Byte Placeholders (No longer needed, constructed dynamically) ---
 # STREAM_TYPE_BYTE_RAW = 0x01 # Replace with actual byte value for Raw EMG
@@ -158,25 +157,31 @@ class MyoPod:
         if not client.is_connected:
             raise ValueError("BleakClient must be connected")
         self._client = client
-        self._is_streaming = False
+        self._is_subscribed = False # Renamed from _is_streaming for clarity
         # Store configured/read values
         self._sync_timestamp: float | None = None
         self._current_config: StreamConfiguration | None = None
 
     async def configure_stream(self, stream_source: EmgStreamSource, compression: CompressionType = CompressionType.NONE, average_samples: int = 1, data_stream_schema: int = 0) -> None:
-        """Configures the EMG data stream.
+        """Configures the MyoPod data stream, starting or stopping it.
 
         Writes to the Data Stream Configuration characteristic (0x3101).
+        Setting stream_source to a value other than EmgStreamSource.NONE
+        tells the device to start streaming.
+        Setting stream_source to EmgStreamSource.NONE tells the device to stop.
+
+        Note: This *configures* the stream on the device. You must separately call
+        `start_stream()` to subscribe to notifications and `stop_stream()` to
+        unsubscribe on the client side.
 
         Args:
-            stream_source: The desired data source (RAW_EMG, PROCESSED_EMG, etc.).
+            stream_source: The desired data source (or EmgStreamSource.NONE to stop).
             compression: The desired compression type.
-            average_samples: Number of samples to average (uint16). Set to 1 for no averaging.
+            average_samples: Number of samples to average (uint16).
             data_stream_schema: The desired schema version for the Data Stream characteristic (0x3102).
-                                Should typically be <= Max Data Stream Schema from read_only_configuration.
         """
-        if self._is_streaming:
-            logger.warning("Cannot configure stream while already streaming. Stop stream first.")
+        if self._is_subscribed:
+            logger.warning("Cannot configure stream while already subscribed. Stop stream first.")
             return
         if average_samples < 1 or average_samples > 65535:
             raise ValueError("average_samples must be between 1 and 65535")
@@ -187,7 +192,7 @@ class MyoPod:
         active_stream_byte = (stream_source.value << 4) | compression.value
 
         # Warn if averaging is set for non-averaged sources (though allowed by protocol)
-        if average_samples > 1 and stream_source not in [EmgStreamSource.PROCESSED_EMG, EmgStreamSource.FILTERED_EMG, EmgStreamSource.RAW_EMG, EmgStreamSource.IMU]: # Add others if they support averaging
+        if average_samples > 1 and stream_source not in [EmgStreamSource.PROCESSED_EMG, EmgStreamSource.FILTERED_EMG, EmgStreamSource.RAW_EMG, EmgStreamSource.IMU]:
             logger.warning(f"Averaging ({average_samples} samples) requested for stream source {stream_source.name}, which might not be typical.")
 
         # --- Construct the configuration payload (Schema Version 0 Write) ---
@@ -204,102 +209,71 @@ class MyoPod:
         )
 
         try:
-            logger.debug(f"Writing stream configuration {config_payload.hex()} to {DATA_STREAM_CONFIG_CHAR_UUID}")
+            action = "Starting" if stream_source != EmgStreamSource.NONE else "Stopping"
+            logger.debug(f"{action} stream by writing configuration {config_payload.hex()} to {DATA_STREAM_CONFIG_CHAR_UUID}")
             await self._client.write_gatt_char(DATA_STREAM_CONFIG_CHAR_UUID, config_payload, response=False)
             # Clear previous read config as it's now potentially stale
             self._current_config = None
-            logger.info(f"MyoPod stream configured: Source={stream_source.name}, Comp={compression.name}, AvgSamples={average_samples}, StreamSchema={data_stream_schema}")
+            if stream_source != EmgStreamSource.NONE:
+                 logger.info(f"MyoPod stream configured/started on device: Source={stream_source.name}, Comp={compression.name}, AvgSamples={average_samples}, StreamSchema={data_stream_schema}")
+            else:
+                logger.info("MyoPod stream stopped on device.")
         except Exception as e:
-            logger.error(f"Failed to configure MyoPod stream: {e}")
+            logger.error(f"Failed to configure/control MyoPod stream: {e}")
             raise
 
-    async def _send_control_command(self, command_code: int, command_data: bytes = b'') -> None:
-        """Helper function to send a command to the Control Command characteristic."""
-        # --- Construct the command payload (Schema Version 0) ---
-        # Offset 0: Data Schema Version (1 byte) = CONTROL_COMMAND_SCHEMA_VERSION
-        # Offset 1: Command (8-bit Enum) = command_code
-        # Offset 2: Command Status (8-bit Mask) = IS_REQUEST
-        # Offset 3: Command Data Length (Unsigned 8-bit) = len(command_data)
-        # Offset 4: Command Data (0-244 bytes) = command_data
-        data_len = len(command_data)
-        if data_len > 244:
-            raise ValueError(f"Command data too long: {data_len} bytes (max 244)")
-
-        command_payload = struct.pack(
-            '>BBBB',
-            CONTROL_COMMAND_SCHEMA_VERSION,
-            command_code,
-            CONTROL_CMD_STATUS_IS_REQUEST,
-            data_len
-        ) + command_data
-
-        logger.debug(f"Sending control command {command_payload.hex()} to {CONTROL_COMMANDS_CHAR_UUID}")
-        await self._client.write_gatt_char(CONTROL_COMMANDS_CHAR_UUID, command_payload, response=False)
-        # Note: We are not currently set up to listen for or handle command *responses* on this characteristic.
-
     async def start_stream(self, notification_handler: Callable[[int, bytearray], Any]) -> None:
-        """Starts the EMG data stream.
+        """Subscribe to notifications from the Data Stream characteristic (0x3102).
 
-        Subscribes to notifications on the Data Stream characteristic (0x3102)
-        and sends the 'Start Stream' command to the Control Command characteristic (0x4102).
+        This allows the client to receive data when the device is streaming.
+        It does NOT tell the device to start sending data; use `configure_stream`
+        with a non-NONE source for that.
 
         Args:
             notification_handler: The asynchronous callback function to handle incoming data.
                 The handler should accept two arguments: sender (int) and data (bytearray).
         """
-        if self._is_streaming:
-            logger.warning("Stream is already active.")
+        if self._is_subscribed:
+            logger.warning("Already subscribed to stream notifications.")
             return
 
         try:
             logger.debug(f"Subscribing to data notifications from {DATA_STREAM_CHAR_UUID}")
             await self._client.start_notify(DATA_STREAM_CHAR_UUID, notification_handler)
-
-            logger.debug("Sending Start Stream command")
-            await self._send_control_command(CMD_CODE_START_STREAM)
-
-            self._is_streaming = True
-            logger.info("MyoPod stream started.")
-
+            self._is_subscribed = True
+            logger.info("Subscribed to MyoPod stream notifications.")
         except Exception as e:
-            logger.error(f"Failed to start MyoPod stream: {e}")
-            # Attempt to clean up if subscription succeeded but command failed
-            try:
-                await self._client.stop_notify(DATA_STREAM_CHAR_UUID)
-            except Exception as stop_e:
-                logger.error(f"Failed to clean up notification subscription: {stop_e}")
+            logger.error(f"Failed to subscribe to MyoPod stream: {e}")
+            self._is_subscribed = False # Ensure state is correct on failure
             raise e
 
     async def stop_stream(self) -> None:
-        """Stops the EMG data stream.
+        """Unsubscribe from notifications on the Data Stream characteristic (0x3102).
 
-        Sends the 'Stop Stream' command to the Control Command characteristic (0x4102)
-        and unsubscribes from notifications on the Data Stream characteristic (0x3102).
+        This stops the client from receiving data.
+        It does NOT tell the device to stop sending data; use `configure_stream`
+        with EmgStreamSource.NONE for that.
         """
-        if not self._is_streaming:
-            logger.warning("Stream is not active.")
+        if not self._is_subscribed:
+            logger.warning("Not currently subscribed to stream notifications.")
             return
 
         try:
-            logger.debug("Sending Stop Stream command")
-            await self._send_control_command(CMD_CODE_STOP_STREAM)
-
             logger.debug(f"Unsubscribing from data notifications from {DATA_STREAM_CHAR_UUID}")
             await self._client.stop_notify(DATA_STREAM_CHAR_UUID)
-
-            self._is_streaming = False
-            logger.info("MyoPod stream stopped.")
-
+            self._is_subscribed = False
+            logger.info("Unsubscribed from MyoPod stream notifications.")
         except Exception as e:
-            logger.error(f"Failed to stop MyoPod stream: {e}")
-            # Note: We might be in an inconsistent state.
-            self._is_streaming = False # Assume stopped or attempting to stop
+            logger.error(f"Failed to unsubscribe from MyoPod stream: {e}")
+            # Note: Client might still be considered subscribed by bleak even if device fails?
+            # For safety, set state to False.
+            self._is_subscribed = False
             raise
 
     @property
-    def is_streaming(self) -> bool:
-        """Returns True if the EMG stream is currently active."""
-        return self._is_streaming
+    def is_subscribed(self) -> bool:
+        """Returns True if the client is currently subscribed to EMG stream notifications."""
+        return self._is_subscribed
 
     @property
     def is_connected(self) -> bool:

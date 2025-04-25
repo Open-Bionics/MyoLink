@@ -58,15 +58,18 @@ async def connect_and_stream(device_info: Tuple[BLEDevice, ParsedAdvertisingData
 
             try:
                 # Configure stream (e.g., Processed EMG, No Compression)
+                # This write also tells the device to START sending
                 target_source = EmgStreamSource.PROCESSED_EMG
                 target_compression = CompressionType.NONE
-                logger.info(f"{log_prefix} Configuring stream: {target_source.name}, {target_compression.name}")
+                logger.info(f"{log_prefix} Configuring stream to start: {target_source.name}, {target_compression.name}")
                 await myopod.configure_stream(target_source, target_compression)
+                await asyncio.sleep(0.1) # Short delay
 
                 # Create a handler specific to this device using functools.partial
                 handler = functools.partial(handle_multi_emg_data, device.address)
 
-                logger.info(f"{log_prefix} Starting stream...")
+                # Subscribe to receive notifications
+                logger.info(f"{log_prefix} Subscribing to notifications...")
                 await myopod.start_stream(handler)
 
                 # Stream for the duration (or until disconnect)
@@ -80,12 +83,19 @@ async def connect_and_stream(device_info: Tuple[BLEDevice, ParsedAdvertisingData
             except Exception as e:
                 logger.error(f"{log_prefix} Error during streaming: {e}")
             finally:
-                if myopod.is_streaming:
-                    logger.info(f"{log_prefix} Stopping stream...")
+                # Stop sequence: Tell device to stop, then unsubscribe client
+                logger.info(f"{log_prefix} Telling device to stop sending...")
+                try:
+                    await myopod.configure_stream(EmgStreamSource.NONE)
+                except Exception as e:
+                    logger.error(f"{log_prefix} Error telling device to stop: {e}")
+
+                if myopod.is_subscribed:
+                    logger.info(f"{log_prefix} Unsubscribing client...")
                     try:
                         await myopod.stop_stream()
                     except Exception as e:
-                        logger.error(f"{log_prefix} Error stopping stream: {e}")
+                        logger.error(f"{log_prefix} Error unsubscribing: {e}")
 
                 logger.info(f"{log_prefix} Disconnecting...")
 

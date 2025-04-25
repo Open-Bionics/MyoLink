@@ -95,13 +95,13 @@ async def main():
             except Exception as e:
                 logger.warning(f"Could not read initial configs: {e}")
 
-            # 2. Configure the desired stream
+            # 2. Configure the desired stream to START transmission
             # Example: Raw EMG data, compressed to 16-bit integers, averaging every 5 samples
             target_source = EmgStreamSource.RAW_EMG
             target_compression = CompressionType.INT16
             target_avg_samples = 5 # Set to 1 for no averaging
 
-            logger.info(f"Configuring stream: Source={target_source.name}, "
+            logger.info(f"Configuring stream AND telling device to start sending: Source={target_source.name}, "
                         f"Comp={target_compression.name}, AvgSamples={target_avg_samples}")
             await myopod.configure_stream(
                 stream_source=target_source,
@@ -109,13 +109,14 @@ async def main():
                 average_samples=target_avg_samples
                 # data_stream_schema=0 # Defaulting to schema 0
             )
+            await asyncio.sleep(0.1) # Short delay after configuring
 
-            # 3. Start the stream
-            logger.info("Starting stream...")
+            # 3. Subscribe to notifications to actually RECEIVE the data
+            logger.info("Subscribing to stream notifications...")
             await myopod.start_stream(handle_emg_data)
 
             # 4. Run for a defined duration
-            logger.info(f"Streaming data for {RUN_DURATION_SECONDS} seconds...")
+            logger.info(f"Receiving data for {RUN_DURATION_SECONDS} seconds...")
             start_time = time.monotonic()
             while time.monotonic() - start_time < RUN_DURATION_SECONDS:
                 # Check connection status periodically
@@ -127,16 +128,24 @@ async def main():
         except Exception as e:
             logger.error(f"An error occurred during streaming: {e}")
         finally:
-            # 5. Stop the stream (important)
-            if myopod.is_streaming:
-                logger.info("Stopping stream...")
+            # 5. Stop the stream - IMPORTANT: Tell device to stop FIRST, then unsubscribe
+
+            # Tell the device to stop sending data
+            logger.info("Telling device to stop sending stream data...")
+            try:
+                await myopod.configure_stream(EmgStreamSource.NONE)
+            except Exception as e:
+                logger.error(f"Error telling device to stop stream: {e}")
+
+            # Unsubscribe the client from notifications
+            if myopod.is_subscribed:
+                logger.info("Unsubscribing from stream notifications...")
                 try:
                     await myopod.stop_stream()
                 except Exception as e:
-                    logger.error(f"Error stopping stream: {e}")
+                    logger.error(f"Error unsubscribing from stream: {e}")
 
             logger.info("Disconnecting...")
-            # Disconnect happens automatically when exiting the BleakClient context
 
     logger.info("Basic MyoPod streaming example finished.")
 

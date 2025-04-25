@@ -38,31 +38,35 @@ def mock_bleak_client() -> MagicMock:
 	mock_client = MagicMock()
 	mock_client.is_connected = True
 	mock_client.write_gatt_char = AsyncMock() # Mock the async method
+	mock_client.address = "00:11:22:33:44:55" # Add address attribute
 	return mock_client
 
 @pytest.fixture
 def hand_instance(mock_ble_device, mock_bleak_client) -> Hand:
 	"""Creates a Hand instance with a mocked BleakClient."""
-	hand = Hand(mock_ble_device)
-	# Inject the mock client directly for testing command sending
-	hand._client = mock_bleak_client
+	# Pass the mock client directly to the constructor
+	hand = Hand(mock_bleak_client)
+	# REMOVED: hand._client = mock_bleak_client # No longer needed, done in init
 	return hand
 
 # --- Helper Function --- #
 
 def build_expected_command(positions: list[float]) -> bytes:
 	"""Helper to construct the expected command bytes for given positions."""
-	payload = bytearray()
-	payload.append(0x01) # Set Digit Positions Subcommand
+	# Start payload with the specific "Set Digit Positions" sub-byte (0x01)
+	payload = bytearray([0x01])
 	num_digits = len(positions)
 	for i in range(num_digits):
 		digit_id = DIGIT_IDS[i]
 		pos = max(0.0, min(1.0, positions[i])) # Apply clamping like in the method
+		# Append digit ID (1 byte) and position (4 bytes)
 		payload.append(digit_id)
 		payload.extend(struct.pack(">f", pos))
 
+	# Data length is the length of the entire payload (0x01 byte + N * (ID + float))
 	data_length = len(payload)
-	command_header = struct.pack("<BBBB", SCHEMA_VERSION, CMD_SET_DIGIT_POSITIONS, 0x01, data_length)
+	# Corrected Endianness: Use > for Big-Endian header
+	command_header = struct.pack(">BBBB", SCHEMA_VERSION, CMD_SET_DIGIT_POSITIONS, 0x01, data_length)
 	return command_header + payload
 
 # --- Test Cases --- #

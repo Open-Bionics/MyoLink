@@ -1,73 +1,71 @@
-"""Example: Discover and connect to a MyoLink Hand."""
+"""Example: Discover and connect to an OB2 Hand."""
 
 import asyncio
-import sys
 import logging
+import sys
+import os
 
 # Add project root to path if running script directly
-import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from myolink import discover_devices, Hand # type: ignore
-from bleak.backends.device import BLEDevice
+from bleak import BleakClient
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO)
+from myolink import discover_devices, DeviceType, Hand # type: ignore
+
+# Configure logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-async def select_device(prompt: str = "Select a device:") -> BLEDevice:
-	"""Scans for devices and prompts the user to select one."""
-	print("Scanning for devices...")
-	discovered_devices = await discover_devices(timeout=5.0)
-
-	if 0 == len(discovered_devices):
-		print("No devices found. Make sure your device is powered on and advertising.")
-		sys.exit(1)
-
-	print("\nDiscovered devices:")
-	for i, device in enumerate(discovered_devices):
-		print(f"  {i + 1}. {device.name} ({device.address})")
-
-	print("\nNote: Ensure the selected device is paired with your OS for a stable connection.")
-
-	while True:
-		try:
-			selection = int(input(f"\n{prompt} (Enter number): "))
-			if 1 <= selection <= len(discovered_devices):
-				return discovered_devices[selection - 1]
-			else:
-				print("Invalid selection. Please try again.")
-		except ValueError:
-			print("Invalid input. Please enter a number.")
-		except KeyboardInterrupt:
-			print("\nOperation cancelled by user.")
-			sys.exit(0)
-
 async def main():
-	try:
-		selected_ble_device = await select_device("Select the Hand you want to connect to:")
-		hand = Hand(selected_ble_device)
+	hand_device = None
+	hand_ad_data = None
+	logger.info("Scanning for Open Bionics Hands (OB2 Hand)...")
 
-		print(f"\nAttempting to connect to {hand.name} ({hand.address})...")
-		# Use async with for automatic connection/disconnection
-		async with hand:
-			# Check connection status after attempting
-			if hand._client and hand._client.is_connected: # Accessing protected member for status check in example
-				print(f"Successfully connected to {hand.name}. Press Ctrl+C to disconnect.")
-				# Keep connection alive until user interrupts
-				await asyncio.sleep(3600) # Keep alive for an hour or until Ctrl+C
-			else:
-				print(f"Failed to connect to {hand.name}.")
+	# Use the core discover_devices, filtering for OB2_HAND
+	# Returns Dict[str, Tuple[BLEDevice, ParsedAdvertisingData, int]]
+	discovered_hands = await discover_devices(timeout=5.0, device_type=DeviceType.OB2_HAND)
 
-	except asyncio.CancelledError:
-		# This occurs when asyncio.sleep is cancelled, typically by KeyboardInterrupt
-		logger.info("Sleep cancelled, proceeding to disconnect.")
-	except KeyboardInterrupt:
-		print("\nDisconnecting due to user interruption...")
-	except Exception as e:
-		logger.error(f"An unexpected error occurred: {e}")
-	finally:
-		print("Connection closed.")
+	if not discovered_hands:
+		logger.error("No OB2 Hand devices found.")
+		return
+
+	# Select the first discovered hand
+	# Extract the tuple (device, parsed_ad, rssi) from the dict values
+	first_hand_info = list(discovered_hands.values())[0]
+	hand_device, hand_ad_data, rssi = first_hand_info # Unpack the tuple
+
+	logger.info(f"Found Hand: {hand_device.address} ({hand_device.name}), RSSI: {rssi}")
+	if hand_ad_data:
+		 logger.info(f"  Details: Schema={hand_ad_data.schema_version}, "
+					 f"Batt={hand_ad_data.battery_level}%, "
+					 f"Config={hand_ad_data.device_config}, "
+					 f"Specifics={hand_ad_data.device_specific_data}")
+
+	logger.info(f"Connecting to {hand_device.address}...")
+	# **Important:** Use the BLEDevice object (hand_device), not the Hand class instance yet
+	async with BleakClient(hand_device) as client:
+		if not client.is_connected:
+			logger.error(f"Failed to connect to {hand_device.address}")
+			return
+
+		logger.info("Connected successfully.")
+		# You could optionally instantiate the Hand class here if needed
+		# hand = Hand(client) # Note: Hand class currently takes BleakClient
+		# logger.info(f"Instantiated Hand object for {hand.address}")
+
+		# Keep connection open for a short time
+		await asyncio.sleep(2)
+
+		logger.info("Disconnecting...")
+		# Disconnect happens automatically when exiting BleakClient context
+
+	logger.info("Connect Hand example finished.")
 
 if __name__ == "__main__":
-	asyncio.run(main()) 
+	try:
+		asyncio.run(main())
+	except KeyboardInterrupt:
+		logger.info("Program interrupted by user.")
+	except Exception as e:
+		logger.error(f"An unexpected error occurred: {e}", exc_info=True) 

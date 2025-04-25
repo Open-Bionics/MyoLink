@@ -44,112 +44,76 @@ class GripType(Enum):
 	# Add other standard grips as needed
 
 class Hand:
-	"""A class to interact with an Open Bionics Hand."""
+	"""A class to interact with an Open Bionics Hand using a connected BleakClient."""
 
-	def __init__(self, device: BLEDevice):
+	def __init__(self, client: BleakClient):
 		"""Initialises the Hand instance.
 
 		Args:
-			device: The BLEDevice object representing the hand.
+			client: The connected BleakClient object for the hand.
 		"""
-		self._device = device
-		self._client: Optional[BleakClient] = None
+		if not isinstance(client, BleakClient):
+			raise TypeError("client must be a BleakClient instance.")
+		if not client.is_connected:
+			raise ValueError("BleakClient must be connected.")
+
+		self._client = client
+		# Store address from client
+		self._address = client.address
 
 	@property
 	def address(self) -> str:
 		"""Returns the MAC address of the hand."""
-		return self._device.address
+		return self._address
 
-	@property
-	def name(self) -> Optional[str]:
-		"""Returns the advertised name of the hand."""
-		return self._device.name
-
-	async def connect(self) -> bool:
-		"""Connects to the hand."""
-		if self._client and self._client.is_connected:
-			logger.info(f"Already connected to {self.name} ({self.address})")
-			return True
-
-		logger.info(f"Connecting to {self.name} ({self.address})...")
-		try:
-			self._client = BleakClient(self._device)
-			await self._client.connect()
-			logger.info(f"Connected successfully to {self.name} ({self.address})")
-			return self._client.is_connected
-		except BleakError as e:
-			logger.error(f"Failed to connect to {self.name} ({self.address}): {e}")
-			self._client = None
-			return False
-		except Exception as e:
-			logger.error(f"An unexpected error occurred during connection: {e}")
-			self._client = None
-			return False
-
-	async def disconnect(self):
-		"""Disconnects from the hand."""
-		if self._client and self._client.is_connected:
-			logger.info(f"Disconnecting from {self.name} ({self.address})...")
-			try:
-				await self._client.disconnect()
-				logger.info(f"Disconnected from {self.name} ({self.address})")
-			except BleakError as e:
-				logger.error(f"Error during disconnection: {e}")
-			except Exception as e:
-				logger.error(f"An unexpected error occurred during disconnection: {e}")
-		else:
-			logger.info(f"Already disconnected from {self.name} ({self.address})")
-		self._client = None
-
-	async def set_digit_positions(self, positions: List[float]):
+	async def set_digit_positions(self, positions: dict[int, float]):
 		"""Sets the position of the specified digits (0.0 to 1.0).
 
-		Digits are set starting from the thumb.
-		Example: [0.5] sets thumb position.
-		Example: [0.5, 0.2] sets thumb and index positions.
-
 		Args:
-			positions: A list of 1 to 5 float values (thumb, index, ...),
-					   each between 0.0 and 1.0.
+			positions: A dictionary mapping digit ID (0-4) to position (0.0-1.0).
+					   Example: {0: 0.5, 1: 0.2} sets thumb and index positions.
 		"""
-		if not (self._client and self._client.is_connected):
+		if not self._client.is_connected:
 			logger.error("Cannot send command: Not connected.")
 			return
 
-		# Validate input list length
-		if not (isinstance(positions, list) and 1 <= len(positions) <= 5):
-			logger.error(f"Invalid positions format. Must be a list of 1 to 5 floats. Received: {positions}")
+		# Validate input dictionary
+		if not isinstance(positions, dict):
+			logger.error(f"Invalid positions format. Must be a dictionary. Received: {type(positions)}")
+			return
+		if not positions: # Check if dict is empty
+			logger.warning("set_digit_positions called with empty positions dictionary.")
 			return
 
-		# Validate and clamp individual positions
-		clamped_positions = []
-		for i, pos in enumerate(positions):
+		# Start payload with the specific "Set Digit Positions" sub-byte (0x01)
+		payload = bytearray([0x01])
+		num_digits_set = 0
+		for digit_id, pos in positions.items():
+			if digit_id not in DIGIT_IDS:
+				logger.warning(f"Invalid digit ID {digit_id} provided. Skipping.")
+				continue
 			if not isinstance(pos, (float, int)):
-				logger.error(f"Invalid position type at index {i}: {type(pos)}. Must be float or int.")
-				return
+				logger.warning(f"Invalid position type for digit {digit_id}: {type(pos)}. Skipping.")
+				continue
+
 			clamped_pos = max(0.0, min(1.0, float(pos)))
-			clamped_positions.append(clamped_pos)
-
-		# Prepare payload only for the provided digits
-		payload = bytearray()
-		num_digits_to_set = len(clamped_positions)
-		for i in range(num_digits_to_set):
-			digit_id = DIGIT_IDS[i] # Get corresponding digit ID
-			pos = clamped_positions[i]
+			# Append digit ID (1 byte) and position (4 bytes)
 			payload.append(digit_id)
-			# Pack float as big-endian 32-bit float (>f)
-			payload.extend(struct.pack(">f", pos))
+			payload.extend(struct.pack(">f", clamped_pos))
+			num_digits_set += 1
 
+		if num_digits_set == 0:
+			logger.error("No valid digit positions provided in the dictionary.")
+			return
+
+		# Data length is the length of the entire payload (0x01 byte + N * (ID + float))
 		data_length = len(payload)
-
-		# Construct final command
-		# Schema | Command ID | Is Request | Data Length | Payload
 		command = struct.pack(">BBBB", SCHEMA_VERSION, CMD_SET_DIGIT_POSITIONS, 0x01, data_length) + payload
 
 		logger.debug(f"Sending Set Digit Positions command: {command.hex()}")
 		try:
 			await self._client.write_gatt_char(CONTROL_CHARACTERISTIC_UUID, command, response=False)
-			logger.info(f"Sent Set Digit Positions command to {self.name} ({self.address})")
+			logger.info(f"Sent Set Digit Positions command to {self.address}")
 		except BleakError as e:
 			logger.error(f"Failed to send command: {e}")
 		except Exception as e:
@@ -161,7 +125,7 @@ class Hand:
 		Args:
 			grip: The GripType enum value representing the desired grip.
 		"""
-		if not (self._client and self._client.is_connected):
+		if not self._client.is_connected:
 			logger.error("Cannot send command: Not connected.")
 			return
 
@@ -181,18 +145,8 @@ class Hand:
 		logger.debug(f"Sending Set Grip command: {command.hex()}")
 		try:
 			await self._client.write_gatt_char(CONTROL_CHARACTERISTIC_UUID, command, response=False)
-			logger.info(f"Sent Set Grip ({grip.name}) command to {self.name} ({self.address})")
+			logger.info(f"Sent Set Grip ({grip.name}) command to {self.address}")
 		except BleakError as e:
 			logger.error(f"Failed to send command: {e}")
 		except Exception as e:
-			logger.error(f"An unexpected error occurred while sending command: {e}")
-
-	# --- Async Context Manager --- #
-	async def __aenter__(self):
-		"""Enters the asynchronous context manager, connecting to the hand."""
-		await self.connect()
-		return self
-
-	async def __aexit__(self, exc_type, exc_val, exc_tb):
-		"""Exits the asynchronous context manager, disconnecting from the hand."""
-		await self.disconnect() 
+			logger.error(f"An unexpected error occurred while sending command: {e}") 
