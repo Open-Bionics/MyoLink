@@ -90,11 +90,11 @@ class Hand:
 		num_digits_set = 0
 		for digit_id, pos in positions.items():
 			if digit_id not in DIGIT_IDS:
-				logger.warning(f"Invalid digit ID {digit_id} provided. Skipping.")
-				continue
+				logger.error(f"Invalid digit ID {digit_id} provided. Aborting command.")
+				return
 			if not isinstance(pos, (float, int)):
-				logger.warning(f"Invalid position type for digit {digit_id}: {type(pos)}. Skipping.")
-				continue
+				logger.error(f"Invalid position type for digit {digit_id}: {type(pos)}. Aborting command.")
+				return
 
 			clamped_pos = max(0.0, min(1.0, float(pos)))
 			# Append digit ID (1 byte) and position (4 bytes)
