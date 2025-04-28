@@ -73,7 +73,16 @@ class MyoPodStreamer(QtWidgets.QWidget):
 		self.plot.setLabel('bottom', "Time (s)")
 		self.plot.setXRange(-PLOT_DURATION_S, 0)
 		self.curve = self.plot.plot(pen='#0085ca')
+
+		# Add right y-axis for converted values
+		self.right_axis = pg.AxisItem('right')
+		self.plot.layout.addItem(self.right_axis, 2, 2)
+		self.plot.showAxis('right')
+		self.plot.getAxis('right').setStyle(showValues=True)
+		self.plot.getViewBox().setContentsMargins(0, 0, 60, 0)  # Add right margin for axis label
+		self.plot_widget.ci.layout.setColumnFixedWidth(2, 15)  # Ensure right axis column is wide enough
 		self.update_plot_title()
+		self.update_right_axis()
 
 		# --- layout ---
 		layout = QtWidgets.QVBoxLayout()
@@ -284,6 +293,7 @@ class MyoPodStreamer(QtWidgets.QWidget):
 				self.conv_factor_label.setText(f"Conv: {conv:.4g}")
 			else:
 				self.conv_factor_label.setText("Conv: ?")
+			self.update_right_axis()
 		except Exception:
 			self.effective_rate_label.setText("Rate: ? Hz")
 			self.native_rate_label.setText("Native: ? Hz")
@@ -467,6 +477,41 @@ class MyoPodStreamer(QtWidgets.QWidget):
 				self.plot.setTitle("EMG Signal")
 		else:
 			self.plot.setTitle("EMG Signal")
+		self.update_right_axis()
+
+	def update_right_axis(self):
+		# Map stream type to units
+		stream_type = self.stream_type_dropdown.currentData()
+		unit_map = {
+			EmgStreamSource.PROCESSED_EMG: '%',
+			EmgStreamSource.FILTERED_EMG: 'mV',
+			EmgStreamSource.RAW_EMG: 'mV',
+			EmgStreamSource.IMU: 'TBD',
+			EmgStreamSource.TEMPERATURES: 'C',
+			EmgStreamSource.FAKE_EMG: '%',
+			EmgStreamSource.AMP_OUTPUT: 'mV',
+		}
+		unit = unit_map.get(stream_type, '') if stream_type else ''
+		conv = getattr(self, 'last_conv_factor', 1.0)
+		# Set axis label
+		label = f"Converted Value ({unit})" if unit else "Converted Value"
+		self.plot.setLabel('right', label)
+		# Custom tick formatter for right axis
+		left_axis = self.plot.getAxis('left')
+		left_range = left_axis.range
+		if left_range is not None:
+			min_left, max_left = left_range
+		else:
+			min_left, max_left = 0, 1
+		# Set right axis ticks to match left, but converted
+		def tick_values():
+			left_ticks = self.plot.getAxis('left').tickValues(10, min_left, max_left)
+			# tickValues returns a list of (spacing, [values])
+			if left_ticks:
+				major_ticks = left_ticks[0][1]
+				return [(v * conv, str(round(v * conv, 2))) for v in major_ticks]
+			return []
+		self.plot.getAxis('right').setTicks([tick_values()])
 
 if __name__ == "__main__":
 	print("Starting application...")
