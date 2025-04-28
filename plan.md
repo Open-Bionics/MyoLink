@@ -56,7 +56,7 @@
 1.  [ ] Implement handling for multiple MyoPod connections.
 2.  [ ] Create `examples/connect_multiple_myopods.py`.
 3.  [ ] Create graphing examples (using `matplotlib` or `pyqtgraph`):
-    *   `examples/graph_single_myopod.py`
+    *   [>] `examples/graph_single_myopod.py` # Started
     *   `examples/graph_multiple_myopods.py`
 4.  [ ] Implement pairing logic (if required).
 5.  [ ] Add comprehensive error handling and logging.
@@ -82,3 +82,6 @@
 ## 6. Future Ideas
 
 *   Provide a library that uses hand tracking machine vision to control the hand.
+*   Produce an Arduino library & examples
+*   Produce a React web app (webcam/slider hand control, EMG graph)
+*   Implement MYoPod events

@@ -1,5 +1,10 @@
 bleak>=0.21.1
 
+# Plotting (for examples)
+pyqtgraph>=0.13.3
+PyQt5>=5.15.0
+qasync>=0.24.0
+
 # Testing
 pytest>=7.0.0
 pytest-asyncio>=0.18.0 

@@ -1,4 +1,8 @@
 """Device specific modules."""
 
 from .hand import Hand
-# Import MyoPod later 
+# MyoPod is imported in the top-level myolink/__init__.py
+
+__all__ = [
+    "Hand",
+] 

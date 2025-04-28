@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "myolink"
+version = "0.1.0" # Initial development version
+description = "A Python library for Open Bionics MyoLink BLE devices."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"} # Or Apache-2.0, specify when decided
+authors = [
+  {name = "Your Name", email = "your@email.com"}, # TODO: Update author details
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License", # Change if license changes
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+]
+dependencies = [
+    "bleak>=0.21.1",
+    # Add other core dependencies here as they become necessary
+    # pyqtgraph and PyQt5 are in requirements.txt but maybe not core deps?
+    # Keep them separate for now unless the core library needs them.
+]
+
+[project.urls]
+Homepage = "https://github.com/YourUsername/MyoLink" # TODO: Update URL
+Repository = "https://github.com/YourUsername/MyoLink" # TODO: Update URL
+
+# Optional: If you want example scripts or entry points, define them here
+# [project.scripts]
+# discover = "myolink.examples.discover_devices:main" # Example
+
+# Optional: Configure setuptools to find your package
+[tool.setuptools.packages.find]
+where = ["."] # Look for packages in the current directory
+include = ["myolink*"]  # Include the myolink package
+exclude = ["examples*", "tests*"] # Exclude example and test directories from the package 
