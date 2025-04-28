@@ -1,9 +1,13 @@
 import asyncio
 from bleak import BleakClient
 from enum import Enum
-from typing import Callable, Any
+from typing import Callable, Any, TYPE_CHECKING
 import logging
 import struct # Added for packing data
+
+# Type hint StreamDataPacket without circular import
+if TYPE_CHECKING:
+    from myolink.myopod import StreamDataPacket
 
 # --- Service UUIDs ---
 DATA_STREAMING_SERVICE_UUID = "0B0B3000-FEED-DEAD-BEE5-08E9B1091C50"
@@ -161,6 +165,27 @@ class MyoPod:
         # Store configured/read values
         self._sync_timestamp: float | None = None
         self._current_config: StreamConfiguration | None = None
+        # Store the user's handler for parsed data
+        self._parsed_data_handler: Callable[['StreamDataPacket'], Any] | None = None
+
+    # --- Internal Raw Notification Handler ---
+    def _raw_notification_handler(self, sender: int, data: bytearray):
+        """Internal handler for raw Bleak notifications."""
+        if self._parsed_data_handler:
+            packet = MyoPod._parse_stream_data(data)
+            if packet is not None:
+                try:
+                    # Call the user's handler with the parsed packet
+                    self._parsed_data_handler(packet)
+                except Exception as e:
+                    # Log exceptions in the user's handler to avoid breaking the stream
+                    logger.error(f"Error in user-provided notification handler: {e}", exc_info=True)
+            else:
+                # Log if parsing failed, as the user's handler won't be called
+                logger.warning(f"Failed to parse data packet (handler not called): {data.hex()}")
+        else:
+            # This shouldn't happen if _is_subscribed is True, but log just in case
+             logger.warning(f"Received stream data but no handler is set. Data: {data.hex()}")
 
     async def configure_stream(self, stream_source: EmgStreamSource, compression: CompressionType = CompressionType.NONE, average_samples: int = 1, data_stream_schema: int = 0) -> None:
         """Configures the MyoPod data stream, starting or stopping it.
@@ -222,29 +247,38 @@ class MyoPod:
             logger.error(f"Failed to configure/control MyoPod stream: {e}")
             raise
 
-    async def start_stream(self, notification_handler: Callable[[int, bytearray], Any]) -> None:
+    async def start_stream(self, parsed_data_handler: Callable[['StreamDataPacket'], Any]) -> None:
         """Subscribe to notifications from the Data Stream characteristic (0x3102).
 
         This allows the client to receive data when the device is streaming.
+        The provided handler will be called with a parsed `StreamDataPacket` object
+        for each valid notification received.
+
         It does NOT tell the device to start sending data; use `configure_stream`
         with a non-NONE source for that.
 
         Args:
-            notification_handler: The asynchronous callback function to handle incoming data.
-                The handler should accept two arguments: sender (int) and data (bytearray).
+            parsed_data_handler: The asynchronous callback function to handle incoming
+                parsed data. It should accept one argument: `packet` (StreamDataPacket).
         """
         if self._is_subscribed:
             logger.warning("Already subscribed to stream notifications.")
             return
+        if None is parsed_data_handler:
+            raise ValueError("parsed_data_handler cannot be None")
 
         try:
             logger.debug(f"Subscribing to data notifications from {DATA_STREAM_CHAR_UUID}")
-            await self._client.start_notify(DATA_STREAM_CHAR_UUID, notification_handler)
+            # Store the user's handler first
+            self._parsed_data_handler = parsed_data_handler
+            # Subscribe using the internal raw handler
+            await self._client.start_notify(DATA_STREAM_CHAR_UUID, self._raw_notification_handler)
             self._is_subscribed = True
             logger.info("Subscribed to MyoPod stream notifications.")
         except Exception as e:
             logger.error(f"Failed to subscribe to MyoPod stream: {e}")
             self._is_subscribed = False # Ensure state is correct on failure
+            self._parsed_data_handler = None # Clear handler on failure
             raise e
 
     async def stop_stream(self) -> None:
@@ -262,12 +296,14 @@ class MyoPod:
             logger.debug(f"Unsubscribing from data notifications from {DATA_STREAM_CHAR_UUID}")
             await self._client.stop_notify(DATA_STREAM_CHAR_UUID)
             self._is_subscribed = False
+            self._parsed_data_handler = None # Clear the handler
             logger.info("Unsubscribed from MyoPod stream notifications.")
         except Exception as e:
             logger.error(f"Failed to unsubscribe from MyoPod stream: {e}")
             # Note: Client might still be considered subscribed by bleak even if device fails?
-            # For safety, set state to False.
+            # For safety, set state to False and clear handler.
             self._is_subscribed = False
+            self._parsed_data_handler = None
             raise
 
     @property
@@ -359,7 +395,7 @@ class MyoPod:
     # --- Data Stream Parsing ---
 
     @staticmethod
-    def _parse_stream_data(data: bytearray) -> StreamDataPacket | None:
+    def _parse_stream_data(data: bytearray) -> 'StreamDataPacket | None':
         """Parses a raw data packet from the Data Stream characteristic (0x3102).
 
         Args:

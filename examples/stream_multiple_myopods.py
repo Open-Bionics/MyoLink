@@ -11,9 +11,12 @@ from bleak.backends.scanner import AdvertisementData
 from myolink.discovery import (
     parse_advertisement_data, DeviceType, ParsedAdvertisingData
 )
-from myolink.myopod import (MyoPod, EmgStreamSource, CompressionType,
-                          StreamDataPacket, READ_ONLY_CONFIG_CHAR_UUID,
-                          DATA_STREAMING_SERVICE_UUID)
+from myolink.myopod import (
+    MyoPod, EmgStreamSource, CompressionType,
+    StreamDataPacket, # Import StreamDataPacket
+    READ_ONLY_CONFIG_CHAR_UUID,
+    DATA_STREAMING_SERVICE_UUID
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -24,21 +27,19 @@ TARGET_DEVICE_NAME_PREFIX = "MyoPod" # Find devices starting with this name
 MAX_DEVICES_TO_CONNECT = 2
 RUN_DURATION_SECONDS = 15
 
-# --- Notification Handler ---
-def handle_multi_emg_data(device_address: str, _sender: int, data: bytearray):
-    """Callback function to handle incoming EMG data notifications from multiple devices."""
-    packet: StreamDataPacket | None = MyoPod._parse_stream_data(data)
-    if packet is not None:
-        # Example: Print block number and first few points, identifying the device
-        points_str = ", ".join(f"{p:.2f}" for p in packet.data_points[:3])
-        if len(packet.data_points) > 3:
-            points_str += "..."
-        logger.info(
-            f"[{device_address}] Block {packet.block_number}: "
-            f"Src={packet.active_stream_source.name}, Comp={packet.compression_type.name}, "
-            f"Points=[{points_str}] ({len(packet.data_points)})")
-    else:
-        logger.warning(f"[{device_address}] Failed to parse data packet: {data.hex()}")
+# --- Notification Handler (Modified) ---
+def handle_multi_emg_data(device_address: str, packet: StreamDataPacket):
+    """Callback function to handle incoming parsed EMG data packets from multiple devices."""
+    # packet is already parsed by MyoPod.start_stream
+    # Example: Print block number and first few points, identifying the device
+    points_str = ", ".join(f"{p:.2f}" for p in packet.data_points[:3])
+    if len(packet.data_points) > 3:
+        points_str += "..."
+    logger.info(
+        f"[{device_address}] Block {packet.block_number}: "
+        f"Src={packet.active_stream_source.name}, Comp={packet.compression_type.name}, "
+        f"Points=[{points_str}] ({len(packet.data_points)})"
+    )
 
 
 async def connect_and_stream(device_info: Tuple[BLEDevice, ParsedAdvertisingData]) -> None:
@@ -66,9 +67,10 @@ async def connect_and_stream(device_info: Tuple[BLEDevice, ParsedAdvertisingData
                 await asyncio.sleep(0.1) # Short delay
 
                 # Create a handler specific to this device using functools.partial
+                # The handler now expects (device_address, packet)
                 handler = functools.partial(handle_multi_emg_data, device.address)
 
-                # Subscribe to receive notifications
+                # Subscribe to receive notifications, passing the handler
                 logger.info(f"{log_prefix} Subscribing to notifications...")
                 await myopod.start_stream(handler)
 

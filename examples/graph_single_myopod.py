@@ -7,6 +7,7 @@ from bleak import BleakClient, BleakError
 from myolink.core import discover_devices
 from myolink.discovery import DeviceType, Chirality
 from myolink import MyoPod, EmgStreamSource, CompressionType
+from myolink.myopod import StreamDataPacket
 
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
@@ -151,21 +152,22 @@ class MyoPodStreamer(QtWidgets.QWidget):
 			y_data = np.array(self.emg_data)
 			self.curve.setData(x_data, y_data)
 
-	def emg_notification_handler(self, sender, data):
-		if data:
+	def emg_notification_handler(self, packet: StreamDataPacket):
+		"""Handles incoming parsed EMG data packets."""
+		if packet.data_points:
 			try:
-				from myolink.myopod import MyoPod
-				packet = MyoPod._parse_stream_data(data)
-				if packet is not None:
-					if packet.data_points:
-						value = packet.data_points[0]
-						current_time = time.perf_counter()
-						self.emg_data.append(value)
-						self.timestamps.append(current_time)
-				else:
-					print(f"[DEBUG] Failed to parse packet: {data.hex()}")
+				# Assuming one data point per packet for simplicity in this example
+				# If multiple points arrive, you might need to adjust timestamp logic
+				# or process all points.
+				value = packet.data_points[0]
+				current_time = time.perf_counter() # Use local time for plotting
+				self.emg_data.append(value)
+				self.timestamps.append(current_time)
+			except IndexError:
+				print("[DEBUG] Received packet with empty data_points list")
 			except Exception as e:
-				print(f"[DEBUG] Exception in notification handler: {e}")
+				# Error handling within the handler itself
+				print(f"[DEBUG] Exception in EMG handler processing: {e}")
 
 	async def background_scan(self):
 		from myolink.core import discover_devices
@@ -336,7 +338,8 @@ class MyoPodStreamer(QtWidgets.QWidget):
 				average_samples=avg_samples
 			)
 			
-			# Set up notification handler with minimal processing
+			# Set up notification handler
+			# Pass the handler expecting a StreamDataPacket to start_stream
 			print(f"[DEBUG] Starting stream (subscribing to notifications)")
 			await myopod.start_stream(self.emg_notification_handler)
 			
@@ -398,18 +401,43 @@ class MyoPodStreamer(QtWidgets.QWidget):
 		self.connecting_anim_timer.stop()
 		self.connecting_timeout_timer.stop()
 		
-		# create a new event loop for cleanup
-		loop = asyncio.new_event_loop()
-		asyncio.set_event_loop(loop)
-		
-		try:
-			# run disconnect synchronously in the new loop
-			loop.run_until_complete(self.disconnect_current())
-		finally:
-			# close the loop
-			loop.close()
-			# restore the original event loop
-			asyncio.set_event_loop(None)
+		# Get the existing qasync event loop
+		loop = asyncio.get_event_loop()
+
+		# Schedule disconnect on the existing loop if it's running
+		if loop.is_running() and self.current_client and self.current_client.is_connected:
+			print("Scheduling disconnect...") # Debug print
+			# Run disconnect synchronously within the event loop's control
+			# Use ensure_future or create_task and let the loop handle it during shutdown,
+			# or attempt run_until_complete carefully.
+			# Simple scheduling might be safer during Qt close.
+			disconnect_task = asyncio.ensure_future(self.disconnect_current(), loop=loop)
+			
+			# Optional: Add a callback to log completion or errors
+			def _disconnect_done(task):
+				try:
+					task.result() # Raise exception if disconnect failed
+					print("Disconnect task completed.")
+				except Exception as e:
+					print(f"Error during scheduled disconnect: {e}")
+			
+			disconnect_task.add_done_callback(_disconnect_done)
+			
+			# Allow the event loop some time to process the task before closing
+			# This is a bit heuristic; qasync might handle loop termination better.
+			# loop.run_until_complete(asyncio.sleep(0.1)) # Avoid blocking if possible
+			
+		else:
+			print("Skipping disconnect schedule (loop not running or not connected).")
+
+		# Old code creating new loop (causes error)
+		# loop = asyncio.new_event_loop()
+		# asyncio.set_event_loop(loop)
+		# try:
+		# 	loop.run_until_complete(self.disconnect_current())
+		# finally:
+		# 	loop.close()
+		# 	asyncio.set_event_loop(None)
 		
 		event.accept()
 
@@ -421,8 +449,15 @@ class MyoPodStreamer(QtWidgets.QWidget):
 	async def apply_stream_config(self):
 		if self.current_myopod and self.current_myopod.is_connected and self.streaming:
 			try:
+				# Stop the current stream before reconfiguring
 				if self.current_myopod.is_subscribed:
 					await self.current_myopod.stop_stream()
+				
+				# --- Clear plot data before changing stream type ---
+				self.clear_plot()
+				# Optionally, reset y-axis range or enable auto-range briefly
+				# self.plot.enableAutoRange(axis='y', enable=True)
+				# -----------------------------------------------------
 				
 				stream_type = self.stream_type_dropdown.currentData()
 				compression = self.compression_dropdown.currentData()
@@ -439,6 +474,7 @@ class MyoPodStreamer(QtWidgets.QWidget):
 					average_samples=avg_samples
 				)
 				
+				# Pass the handler expecting a StreamDataPacket
 				await self.current_myopod.start_stream(self.emg_notification_handler)
 				
 				try:

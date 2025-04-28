@@ -9,9 +9,12 @@ from myolink.discovery import (
     parse_advertisement_data, DeviceType, HandSpecificData,
     SensorSpecificDataV2, SensorSpecificDataV3
 )
-from myolink.myopod import (MyoPod, EmgStreamSource, CompressionType,
-                          StreamDataPacket, READ_ONLY_CONFIG_CHAR_UUID,
-                          DATA_STREAMING_SERVICE_UUID)
+from myolink.myopod import (
+    MyoPod, EmgStreamSource, CompressionType,
+    StreamDataPacket, # Import StreamDataPacket
+    READ_ONLY_CONFIG_CHAR_UUID,
+    DATA_STREAMING_SERVICE_UUID
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -21,23 +24,18 @@ logger = logging.getLogger(__name__)
 TARGET_DEVICE_NAME = "MyoPod" # Name matching can be less reliable
 RUN_DURATION_SECONDS = 10
 
-# --- Notification Handler ---
-def handle_emg_data(_sender: int, data: bytearray):
-    """Callback function to handle incoming EMG data notifications."""
-    packet: StreamDataPacket | None = MyoPod._parse_stream_data(data)
-    if packet is not None:
-        # Example: Print the block number and the first few data points
-        points_str = ", ".join(f"{p:.2f}" for p in packet.data_points[:5])
-        if len(packet.data_points) > 5:
-            points_str += "..."
-        logger.info(
-            f"Block {packet.block_number}: TS={packet.timestamp:.3f}s, " 
-            f"Src={packet.active_stream_source.name}, Comp={packet.compression_type.name}, " 
-            f"Factor={packet.conversion_factor:.4f}, Points=[{points_str}] ({len(packet.data_points)} samples)"
-        )
-    else:
-        logger.warning(f"Failed to parse data packet: {data.hex()}")
-
+# --- Notification Handler (Modified) ---
+def handle_emg_data(packet: StreamDataPacket):
+    """Callback function to handle incoming parsed EMG data packets."""
+    # packet is already parsed by MyoPod.start_stream
+    points_str = ", ".join(f"{p:.2f}" for p in packet.data_points[:5])
+    if len(packet.data_points) > 5:
+        points_str += "..."
+    logger.info(
+        f"Block {packet.block_number}: TS={packet.timestamp:.3f}s, "
+        f"Src={packet.active_stream_source.name}, Comp={packet.compression_type.name}, "
+        f"Factor={packet.conversion_factor:.4f}, Points=[{points_str}] ({len(packet.data_points)} samples)"
+    )
 
 async def main():
     myopod_device = None
@@ -112,6 +110,7 @@ async def main():
             await asyncio.sleep(0.1) # Short delay after configuring
 
             # 3. Subscribe to notifications to actually RECEIVE the data
+            # Pass the handler that now expects a StreamDataPacket
             logger.info("Subscribing to stream notifications...")
             await myopod.start_stream(handle_emg_data)
 
