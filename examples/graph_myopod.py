@@ -91,6 +91,9 @@ class MyoPodStreamer(QtWidgets.QWidget):
 		self.plot.setLabel('left', "EMG Reading")
 		self.plot.setLabel('bottom', "Time (s)")
 		self.plot.setXRange(-PLOT_DURATION_S, 0)
+		# Enable performance optimisations
+		self.plot.setClipToView(True) # Clip data to visible range
+		self.plot.setDownsampling(mode='peak') # Enable downsampling
 		# Curves will be managed dynamically later
 
 		# Add right y-axis for converted values (Keep for now, needs rework)
@@ -107,12 +110,12 @@ class MyoPodStreamer(QtWidgets.QWidget):
 
 		# --- Data Structures (Revised) ---
 		self.discovered_devices = {} # address -> (BLEDevice, parsed_ad, rssi, last_seen)
-		self.connected_devices = {} # address -> dict {client, myopod, data_deque, timestamp_deque, curve, colour, native_rate, conv_factor, streaming}
+		self.connected_devices = {} # address -> dict {client, myopod, data_deque, timestamp_deque, curve, colour, native_rate, conv_factor, streaming, notification_queue}
 
 		# --- Timers (Keep relevant ones) ---
 		self.plot_timer = QtCore.QTimer()
 		self.plot_timer.timeout.connect(self.update_plot)
-		self.plot_timer.start(100) # Increase interval to 100ms (10Hz update rate)
+		self.plot_timer.start(100)	# update frequency (100Hz)
 
 		self.scan_timer = QtCore.QTimer()
 		self.scan_timer.timeout.connect(lambda: asyncio.create_task(self.background_scan()))
@@ -131,21 +134,46 @@ class MyoPodStreamer(QtWidgets.QWidget):
 		print(msg)
 
 	def update_plot(self):
-		"""Updates all active plot curves with new data."""
-		now = time.perf_counter() # Use a common 'now' for alignment if needed
-		
-		for address, device_info in self.connected_devices.items():
-			timestamps = device_info['timestamp_deque']
-			data = device_info['data_deque']
-			curve = device_info['curve']
-			
-			if timestamps and curve:
-				# Use the latest timestamp from *this* device for its relative x-axis
-				last_ts = timestamps[-1]
-				x_data = np.array([t - last_ts for t in timestamps])
-				y_data = np.array(data)
+		"""Updates all active plot curves with new data from the queues."""
+		# self.log("[DEBUG] update_plot called") # Optional high-frequency log
+		for address, device_info in list(self.connected_devices.items()):
+			notification_queue = device_info.get('notification_queue')
+			data_deque = device_info.get('data_deque')
+			timestamp_deque = device_info.get('timestamp_deque')
+			curve = device_info.get('curve')
+
+			if not notification_queue or not data_deque or not timestamp_deque or not curve:
+				continue
+
+			# Process all pending notifications from the queue for this device
+			packets_processed = 0
+			# self.log(f"[DEBUG] Checking queue for {address}") # Optional high-frequency log
+			while not notification_queue.empty():
+				try:
+					packet: StreamDataPacket = notification_queue.get_nowait()
+					if packet and packet.data_points:
+						current_time = time.perf_counter()
+						num_points = len(packet.data_points)
+						data_deque.extend(packet.data_points)
+						timestamp_deque.extend([current_time] * num_points)
+						packets_processed += 1
+				except asyncio.QueueEmpty:
+					break
+				except Exception as e:
+					self.log(f"[ERROR] Error processing packet from queue for {address}: {e}")
+					break
+
+			if packets_processed > 0:
+				self.log(f"[DEBUG] Processed {packets_processed} packets from queue for {address}")
+
+			# Update plot only if data exists
+			# self.log(f"[DEBUG] Deque size for {address} before plot: {len(data_deque)}") # Optional high-frequency log
+			if data_deque:
+				last_ts = timestamp_deque[-1]
+				x_data = [t - last_ts for t in timestamp_deque]
+				y_data = list(data_deque)
 				curve.setData(x_data, y_data)
-			elif curve: # Clear curve if no data but curve exists
+			elif curve:
 				curve.setData([], [])
 
 	async def background_scan(self):
@@ -343,7 +371,7 @@ class MyoPodStreamer(QtWidgets.QWidget):
 		self.update_device_list()
 
 	async def connect_device(self, address):
-		"""Connects to a single device, sets up stream and plot curve."""
+		"""Connects to a single device, sets up stream, plot curve, and notification queue."""
 		if address not in self.discovered_devices:
 			self.log(f"Error connecting to {address}: Not found in discovered devices.")
 			return
@@ -357,11 +385,20 @@ class MyoPodStreamer(QtWidgets.QWidget):
 		ble_device, _, _, _ = self.discovered_devices[address]
 		self.log(f"Connecting to {address}...")
 
+		# --- Stop scanning timer if this is the first connection ---
+		if not self.connected_devices: # Check before adding the new device
+			self.log("First device connecting, stopping background scan.")
+			self.scan_timer.stop()
+
 		try:
 			client = BleakClient(ble_device)
 			await client.connect()
 			if not client.is_connected:
 				self.log(f"Failed to connect to {address}")
+				# Restart scanning if connection failed and no other devices are connected
+				if not self.connected_devices:
+					self.log("Connection failed, restarting background scan.")
+					self.scan_timer.start(300)
 				return
 
 			myopod = MyoPod(client)
@@ -372,7 +409,10 @@ class MyoPodStreamer(QtWidgets.QWidget):
 			curve = self.plot.plot(pen=assigned_colour)
 			self.log(f"Assigned colour {assigned_colour} to {address}")
 
-			# --- Store Connection Info ---
+			# --- Create Notification Queue ---
+			notification_queue = asyncio.Queue()
+
+			# --- Store Connection Info (including queue) ---
 			device_info = {
 				'client': client,
 				'myopod': myopod,
@@ -382,7 +422,8 @@ class MyoPodStreamer(QtWidgets.QWidget):
 				'colour': assigned_colour,
 				'native_rate': SAMPLE_RATE_HZ, # Placeholder, updated later
 				'conv_factor': None,
-				'streaming': False
+				'streaming': False,
+				'notification_queue': notification_queue # Add the queue
 			}
 			self.connected_devices[address] = device_info
 
@@ -400,7 +441,7 @@ class MyoPodStreamer(QtWidgets.QWidget):
 			)
 
 			# --- Start Stream Notifications ---
-			# Use partial to include address in handler callback
+			# Handler now just puts packet onto the queue
 			bound_handler = functools.partial(self.notification_handler, address)
 			self.log(f"[{address}] Starting stream subscription...")
 			await myopod.start_stream(bound_handler)
@@ -419,14 +460,25 @@ class MyoPodStreamer(QtWidgets.QWidget):
 
 		except BleakError as e:
 			self.log(f"Connection to {address} failed (BleakError): {e}")
-			# Cleanup potentially partially connected state
-			await self.disconnect_device(address)
+			# Ensure cleanup and potentially restart scanning
+			await self.handle_connection_failure(address)
 		except Exception as e:
 			self.log(f"Error during connection to {address}: {e}")
-			await self.disconnect_device(address)
+			# Ensure cleanup and potentially restart scanning
+			await self.handle_connection_failure(address)
 		finally:
-			# Update UI list regardless of success/failure
-			self.update_device_list() # Update bolding/checkmark
+			self.update_device_list()
+
+	async def handle_connection_failure(self, address):
+		"""Handles cleanup after a connection attempt fails."""
+		# Device might have been partially added to connected_devices if error occurred late
+		if address in self.connected_devices:
+			await self.disconnect_device(address) # Use existing disconnect logic for cleanup
+		else:
+			# If it wasn't even added, just check if scanning needs restarting
+			if not self.connected_devices and not self.scan_timer.isActive():
+				self.log("Connection failed, restarting background scan.")
+				self.scan_timer.start(300)
 
 	async def disconnect_device(self, address):
 		"""Disconnects a single device and cleans up resources."""
@@ -467,27 +519,26 @@ class MyoPodStreamer(QtWidgets.QWidget):
 			client = None
 
 		self.log(f"Disconnect of {address} complete.")
+		# Restart scanning timer if this was the last connected device
+		if not self.connected_devices and not self.scan_timer.isActive():
+			self.log("Last device disconnected, restarting background scan.")
+			self.scan_timer.start(300)
+
 		# Update UI list after disconnect is fully processed
 		self.update_device_list()
 
 	def notification_handler(self, address, packet: StreamDataPacket):
-		"""Handles incoming parsed packets and routes data to the correct deques."""
-		if address in self.connected_devices:
-			device_info = self.connected_devices[address]
-			data_deque = device_info['data_deque']
-			timestamp_deque = device_info['timestamp_deque']
-			
-			if packet.data_points:
-				# For simplicity, assume packets arrive roughly in order
-				# and use perf_counter for local timing.
-				# A more robust solution might use packet timestamps if available/reliable.
-				current_time = time.perf_counter()
-				for value in packet.data_points:
-					data_deque.append(value)
-					timestamp_deque.append(current_time)
-				# Note: If multiple points are in one packet, they get the same timestamp here.
-		else:
-			self.log(f"[WARN] Received notification for unknown or disconnected device: {address}")
+		"""Minimal handler: Puts received packet onto the device's queue."""
+		try:
+			if address in self.connected_devices:
+				queue = self.connected_devices[address].get('notification_queue')
+				if queue:
+					queue.put_nowait(packet)
+					# self.log(f"[DEBUG] Queued packet for {address} (Points: {len(packet.data_points) if packet else 0})") # Optional high-frequency log
+		except asyncio.QueueFull:
+			self.log(f"[WARN] Notification queue full for {address}. Discarding packet.")
+		except Exception as e:
+			self.log(f"[ERROR] Exception in notification_handler for {address}: {e}")
 
 	async def apply_global_stream_config(self):
 		"""Applies the global stream configuration to all connected devices sequentially."""
