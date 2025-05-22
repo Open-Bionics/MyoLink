@@ -45,8 +45,6 @@ class MyoPodStreamer(QtWidgets.QWidget):
 		self.connect_selected_btn = QtWidgets.QPushButton("Connect Selected")
 		sidebar_layout.addWidget(self.connect_selected_btn)
 
-		sidebar_layout.addSpacing(20)
-
 		# Stream Configuration (Single Global Set)
 		sidebar_layout.addWidget(QtWidgets.QLabel("Global Stream Configuration:"))
 		config_layout = QtWidgets.QGridLayout()
@@ -65,6 +63,12 @@ class MyoPodStreamer(QtWidgets.QWidget):
 		config_layout.addWidget(self.avg_samples_spin, 2, 1)
 		sidebar_layout.addLayout(config_layout)
 		sidebar_layout.addWidget(self.apply_config_btn)
+
+		# Add Pause Button (after stream configuration, before the stretch)
+		sidebar_layout.addSpacing(20)  # Add some space before the pause button
+		self.pause_btn = QtWidgets.QPushButton("Pause")
+		self.pause_btn.setCheckable(True)  # Make it a toggle button
+		sidebar_layout.addWidget(self.pause_btn)
 
 		sidebar_layout.addStretch(1) # Push Quit button to bottom
 		self.quit_btn = QtWidgets.QPushButton("Quit")
@@ -92,8 +96,14 @@ class MyoPodStreamer(QtWidgets.QWidget):
 		self.plot.setLabel('bottom', "Time (s)")
 		self.plot.setXRange(-PLOT_DURATION_S, 0)
 		# Enable performance optimisations
-		self.plot.setClipToView(True) # Clip data to visible range
-		self.plot.setDownsampling(mode='peak') # Enable downsampling
+		self.plot.setClipToView(True)
+		self.plot.setDownsampling(mode='peak')
+		# Set initial Y range to small values to see zero-line
+		self.plot.setYRange(-0.1, 0.1)
+		# Enable auto range on Y axis
+		self.plot.enableAutoRange(axis='y')
+		# Show grid
+		self.plot.showGrid(x=True, y=True)
 		# Curves will be managed dynamically later
 
 		# Add right y-axis for converted values (Keep for now, needs rework)
@@ -126,55 +136,112 @@ class MyoPodStreamer(QtWidgets.QWidget):
 		self.connect_selected_btn.clicked.connect(self.on_connect_selected_btn_wrapper)
 		self.apply_config_btn.clicked.connect(lambda: asyncio.create_task(self.apply_global_stream_config()))
 		self.device_list_widget.itemSelectionChanged.connect(self.update_connect_btn_text)
+		self.pause_btn.clicked.connect(self.toggle_pause)
 
 		# Initial UI state update
 		self.update_device_list()
+
+		# Add paused state
+		self.is_paused = False
 
 	def log(self, msg):
 		print(msg)
 
 	def update_plot(self):
 		"""Updates all active plot curves with new data from the queues."""
-		# self.log("[DEBUG] update_plot called") # Optional high-frequency log
-		for address, device_info in list(self.connected_devices.items()):
+		current_time = time.perf_counter()
+		
+		# Debug print connected devices at start of update
+		self.log(f"[DEBUG] Connected devices at start of update: {list(self.connected_devices.keys())}")
+		
+		# Make a copy of connected_devices to prevent modification during iteration
+		devices_to_process = dict(self.connected_devices)
+		
+		# Device data plotting
+		for address, device_info in devices_to_process.items():
+			self.log(f"[DEBUG] Processing device {address}")
+			
+			# Verify device is still connected
+			if address not in self.connected_devices:
+				self.log(f"[WARN] Device {address} was removed during processing")
+				continue
+				
 			notification_queue = device_info.get('notification_queue')
 			data_deque = device_info.get('data_deque')
 			timestamp_deque = device_info.get('timestamp_deque')
 			curve = device_info.get('curve')
 
-			if not notification_queue or not data_deque or not timestamp_deque or not curve:
+			# Log what components we have
+			components = {
+				'queue': notification_queue is not None,
+				'data_deque': data_deque is not None,
+				'timestamp_deque': timestamp_deque is not None,
+				'curve': curve is not None
+			}
+			self.log(f"[DEBUG] Device {address} components: {components}")
+
+			if not all(components.values()):
+				self.log(f"[ERROR] Missing components for {address}: {components}")
 				continue
 
-			# Process all pending notifications from the queue for this device
+			# Debug print current queue sizes
+			self.log(f"[QUEUE] {address} - Queue size: {notification_queue.qsize()}, Data deque size: {len(data_deque)}, Timestamp deque size: {len(timestamp_deque)}")
+
+			# Always process the queue to prevent overflow, even when paused
 			packets_processed = 0
-			# self.log(f"[DEBUG] Checking queue for {address}") # Optional high-frequency log
 			while not notification_queue.empty():
 				try:
 					packet: StreamDataPacket = notification_queue.get_nowait()
 					if packet and packet.data_points:
-						current_time = time.perf_counter()
 						num_points = len(packet.data_points)
-						data_deque.extend(packet.data_points)
-						timestamp_deque.extend([current_time] * num_points)
-						packets_processed += 1
+						time_step = 1.0 / SAMPLE_RATE_HZ
+						timestamps = [current_time - (num_points - i) * time_step for i in range(num_points)]
+						
+						# Only update deques if not paused
+						if not self.is_paused:
+							data_deque.extend(packet.data_points)
+							timestamp_deque.extend(timestamps)
+							packets_processed += 1
+							
+							self.log(f"[DEQUE] {address} - After extend: Data size={len(data_deque)}, Timestamp size={len(timestamp_deque)}")
+							
+							while len(data_deque) > BUFFER_SIZE:
+								data_deque.popleft()
+								timestamp_deque.popleft()
+							
 				except asyncio.QueueEmpty:
 					break
 				except Exception as e:
 					self.log(f"[ERROR] Error processing packet from queue for {address}: {e}")
 					break
 
-			if packets_processed > 0:
-				self.log(f"[DEBUG] Processed {packets_processed} packets from queue for {address}")
-
-			# Update plot only if data exists
-			# self.log(f"[DEBUG] Deque size for {address} before plot: {len(data_deque)}") # Optional high-frequency log
-			if data_deque:
-				last_ts = timestamp_deque[-1]
-				x_data = [t - last_ts for t in timestamp_deque]
-				y_data = list(data_deque)
-				curve.setData(x_data, y_data)
-			elif curve:
-				curve.setData([], [])
+			# Only update the plot if not paused and we have new data
+			if not self.is_paused and packets_processed > 0:
+				try:
+					x_data = list(timestamp_deque)
+					y_data = list(data_deque)
+					
+					if len(x_data) != len(y_data):
+						self.log(f"[ERROR] Data length mismatch: x={len(x_data)}, y={len(y_data)}")
+						continue
+						
+					if len(x_data) == 0:
+						self.log(f"[WARN] No data to plot for {address}")
+						continue
+					
+					x_data = [t - current_time for t in x_data]
+					
+					self.log(f"[PLOT] {address} plotting {len(y_data)} points.")
+					self.log(f"[PLOT] X range: [{min(x_data):.2f}, {max(x_data):.2f}]")
+					self.log(f"[PLOT] Y range: [{min(y_data):.2f}, {max(y_data):.2f}]")
+					
+					curve.setData(x_data, y_data)
+					self.log(f"[PLOT] Updated curve for {address}")
+					
+					self.plot.replot()
+					
+				except Exception as e:
+					self.log(f"[ERROR] Plot update failed for {address}: {e}")
 
 	async def background_scan(self):
 		"""Scans for devices and updates the shared discovery pool."""
@@ -416,16 +483,17 @@ class MyoPodStreamer(QtWidgets.QWidget):
 			device_info = {
 				'client': client,
 				'myopod': myopod,
-				'data_deque': deque(maxlen=BUFFER_SIZE),
-				'timestamp_deque': deque(maxlen=BUFFER_SIZE),
+				'data_deque': deque(maxlen=BUFFER_SIZE),  # Initialize deque
+				'timestamp_deque': deque(maxlen=BUFFER_SIZE),  # Initialize deque
 				'curve': curve,
 				'colour': assigned_colour,
 				'native_rate': SAMPLE_RATE_HZ, # Placeholder, updated later
 				'conv_factor': None,
 				'streaming': False,
-				'notification_queue': notification_queue # Add the queue
+				'notification_queue': notification_queue
 			}
 			self.connected_devices[address] = device_info
+			self.log(f"[INIT] Created device info for {address} with empty deques")
 
 			# --- Apply Global Stream Config ---
 			# Read global config from UI
@@ -441,11 +509,10 @@ class MyoPodStreamer(QtWidgets.QWidget):
 			)
 
 			# --- Start Stream Notifications ---
-			# Handler now just puts packet onto the queue
 			bound_handler = functools.partial(self.notification_handler, address)
 			self.log(f"[{address}] Starting stream subscription...")
 			await myopod.start_stream(bound_handler)
-			self.connected_devices[address]['streaming'] = True # Mark as streaming
+			self.connected_devices[address]['streaming'] = True
 
 			# --- Read Initial Config from Device ---
 			try:
@@ -460,11 +527,9 @@ class MyoPodStreamer(QtWidgets.QWidget):
 
 		except BleakError as e:
 			self.log(f"Connection to {address} failed (BleakError): {e}")
-			# Ensure cleanup and potentially restart scanning
 			await self.handle_connection_failure(address)
 		except Exception as e:
 			self.log(f"Error during connection to {address}: {e}")
-			# Ensure cleanup and potentially restart scanning
 			await self.handle_connection_failure(address)
 		finally:
 			self.update_device_list()
@@ -497,7 +562,7 @@ class MyoPodStreamer(QtWidgets.QWidget):
 			try:
 				self.plot.removeItem(curve)
 			except Exception as e:
-				self.log(f"[{address}] Error removing plot curve: {e}")
+				self.log(f"[ERROR] Error removing plot curve: {e}")
 
 		# Stop stream and disconnect client
 		if myopod:
@@ -505,7 +570,7 @@ class MyoPodStreamer(QtWidgets.QWidget):
 				if myopod.is_subscribed:
 					await myopod.stop_stream()
 			except Exception as e:
-				self.log(f"[{address}] Error stopping stream during disconnect: {e}")
+				self.log(f"[ERROR] Error stopping stream during disconnect: {e}")
 			# Clear MyoPod object
 			myopod = None # Redundant as we popped dict entry, but safe
 
@@ -514,7 +579,7 @@ class MyoPodStreamer(QtWidgets.QWidget):
 				if client.is_connected:
 					await client.disconnect()
 			except Exception as e:
-				self.log(f"[{address}] Error disconnecting client: {e}")
+				self.log(f"[ERROR] Error disconnecting client: {e}")
 			# Clear client object
 			client = None
 
@@ -531,10 +596,16 @@ class MyoPodStreamer(QtWidgets.QWidget):
 		"""Minimal handler: Puts received packet onto the device's queue."""
 		try:
 			if address in self.connected_devices:
+				# self.log(f"[NOTIFY] Received packet from {address}: {len(packet.data_points) if packet and packet.data_points else 'no'} points")
+				# self.log(f"[NOTIFY] First few values: {packet.data_points[:5] if packet and packet.data_points else 'none'}")
 				queue = self.connected_devices[address].get('notification_queue')
 				if queue:
 					queue.put_nowait(packet)
-					# self.log(f"[DEBUG] Queued packet for {address} (Points: {len(packet.data_points) if packet else 0})") # Optional high-frequency log
+					# self.log(f"[DEBUG] Queued packet for {address} (Points: {len(packet.data_points) if packet else 0})")
+				else:
+					self.log(f"[ERROR] No queue found for {address}")
+			else:
+				self.log(f"[ERROR] Received notification for unknown device: {address}")
 		except asyncio.QueueFull:
 			self.log(f"[WARN] Notification queue full for {address}. Discarding packet.")
 		except Exception as e:
@@ -681,6 +752,15 @@ class MyoPodStreamer(QtWidgets.QWidget):
 
 		self.log("Accepting close event.")
 		event.accept()
+
+	def toggle_pause(self):
+		"""Toggles the pause state of the graph."""
+		self.is_paused = self.pause_btn.isChecked()
+		if self.is_paused:
+			self.pause_btn.setText("Resume")
+		else:
+			self.pause_btn.setText("Pause")
+		self.log(f"Graph {'paused' if self.is_paused else 'resumed'}")
 
 if __name__ == "__main__":
 	print("Starting application...")
