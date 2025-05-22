@@ -1,0 +1,42 @@
+{
+  "devices": [
+    {
+      "address": "26A9FF0B-15E7-D4A4-25AB-1DDCDF819C4C",
+      "name": "Open Bionics 2DC",
+      "angle": 198.34584192817894,
+      "label": "Close"
+    },
+    {
+      "address": "24EB823C-858D-EDC3-8E0C-BBA41618012A",
+      "name": "Open Bionics 2E3",
+      "angle": 339.9918953210854,
+      "label": "Open"
+    },
+    {
+      "address": "A4AC8F61-1DF3-2CB2-D7D5-D4EC71F51A9C",
+      "name": "Open Bionics 2DC",
+      "angle": 69.71079946223021,
+      "label": "Change Grip"
+    }
+  ],
+  "actions": [
+    {
+      "name": "Close",
+      "start_angle": 170,
+      "end_angle": 220,
+      "color": "#44FFFFFF"
+    },
+    {
+      "name": "Open",
+      "start_angle": 50,
+      "end_angle": 90,
+      "color": "#44FFFFFF"
+    },
+    {
+      "name": "Change Grip",
+      "start_angle": 320,
+      "end_angle": 359,
+      "color": "#44FFFFFF"
+    }
+  ]
+}
