@@ -321,18 +321,23 @@ class Hand:
 			await self._client.write_gatt_char(CONTROL_CHARACTERISTIC_UUID, command, response=False)
 
 			# Wait for the notification handler to set the result of current_request_future
-			humidity_value = await asyncio.wait_for(current_request_future, timeout=timeout) # Default timeout is now 5.0s from method signature
-			return humidity_value
-		except asyncio.TimeoutError:
-			logger.error(f"[{self.address}] Timeout ({timeout}s) waiting for humidity data notification.")
-			if not current_request_future.done():
-				current_request_future.set_exception(asyncio.TimeoutError("Timeout waiting for humidity data"))
-			return None
+			try:
+				humidity_value = await asyncio.wait_for(current_request_future, timeout=timeout)
+			except asyncio.TimeoutError: 
+				logger.error(f"[{self.address}] Timeout ({timeout}s) waiting for humidity data notification (asyncio.wait_for).")
+				if not current_request_future.done():
+					current_request_future.set_exception(asyncio.TimeoutError("Timeout waiting for humidity data (asyncio.wait_for)"))
+				return None 
+			
+			return humidity_value # Return the successfully awaited value
+
+		# Keep a general BleakError catch if write_gatt_char fails, or other Bleak issues
 		except BleakError as e:
 			logger.error(f"[{self.address}] BleakError during Get Relative Humidity command: {e}")
 			if not current_request_future.done():
 				current_request_future.set_exception(e)
 			return None
+		# Catch unexpected errors more broadly too
 		except Exception as e:
 			logger.error(f"[{self.address}] Unexpected error in get_relative_humidity: {e}", exc_info=True)
 			if not current_request_future.done():

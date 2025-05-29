@@ -344,8 +344,8 @@ async def async_main_wrapper():
 		# If only notifications, this loop keeps the program running.
 		while monitor._monitoring_active and monitor._client and monitor._client.is_connected:
 			await asyncio.sleep(0.1) # General keep-alive and event processing
-			if PYQTGRAPH_AVAILABLE and QtWidgets.QApplication.instance():
-				QtWidgets.QApplication.instance().processEvents() # Process Qt events
+			# if PYQTGRAPH_AVAILABLE and QtWidgets.QApplication.instance():
+			# 	QtWidgets.QApplication.instance().processEvents() # Process Qt events - qasync should handle this
 		logger.info("Monitoring loop ended (e.g. disconnected or error in setup).")
 
 	except KeyboardInterrupt:
