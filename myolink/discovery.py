@@ -2,7 +2,7 @@ import struct
 from enum import Enum
 from dataclasses import dataclass, field
 import logging
-from typing import List, Union, Dict, Any
+from typing import List, Union, Dict, Any, Optional
 
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
@@ -124,11 +124,11 @@ class ParsedAdvertisingData:
     device_specific_data: Union[HandSpecificData, SensorSpecificDataV1, SensorSpecificDataV2, SensorSpecificDataV3, int]
     battery_level: int # 0-100 (%)
     # Schema V1 Specific
-    association_id_v1: bytes | None = None # 6 bytes
+    association_id_v1: Optional[bytes] = None # 6 bytes
     # Schema V2/V3 Specific
-    mac_address_part: int | None = None # 4 bytes
-    num_associations: int | None = None
-    association_ids_v2: List[int] | None = None # List of 4-byte uints
+    mac_address_part: Optional[int] = None # 4 bytes
+    num_associations: Optional[int] = None
+    association_ids_v2: Optional[List[int]] = None # List of 4-byte uints
 
     # Add raw manufacturer data for debugging/completeness
     raw_manufacturer_data: bytes = b''
