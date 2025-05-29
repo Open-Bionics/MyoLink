@@ -174,22 +174,28 @@ class Hand:
 
 			# --- Log properties of the control characteristic for debugging ---
 			control_char_found = False
+			# Ensure case-insensitive comparison for UUIDs
+			target_char_uuid_lower = CONTROL_CHARACTERISTIC_UUID.lower()
+
 			for service in self._client.services:
 				for char in service.characteristics:
-					if char.uuid == CONTROL_CHARACTERISTIC_UUID:
+					if char.uuid.lower() == target_char_uuid_lower: # Case-insensitive match
 						logger.info(f"[{self.address}] Found Control Characteristic {char.uuid}: Handle={char.handle}, Properties={char.properties}")
 						control_char_found = True
 						if "notify" not in char.properties:
 							logger.error(f"[{self.address}] CRITICAL: Control Characteristic {char.uuid} DOES NOT support 'notify' property. Properties: {char.properties}")
-							# self._notifications_started = False # Not strictly needed here as we'd raise below
 							raise BleakError(f"Control Characteristic {CONTROL_CHARACTERISTIC_UUID} does not support notifications.")
 						break
 				if control_char_found:
 					break
 			
 			if not control_char_found:
-				logger.error(f"[{self.address}] CRITICAL: Control Characteristic {CONTROL_CHARACTERISTIC_UUID} not found on the device.")
-				# self._notifications_started = False
+				logger.error(f"[{self.address}] CRITICAL: Control Characteristic {CONTROL_CHARACTERISTIC_UUID} (target: {target_char_uuid_lower}) not found on the device.")
+				logger.info(f"[{self.address}] Listing all discovered services and characteristics for debugging:")
+				for service_obj in self._client.services: 
+					logger.info(f"[{self.address}]   Service: {service_obj.uuid} ({service_obj.description})")
+					for char_obj in service_obj.characteristics: 
+						logger.info(f"[{self.address}]     Characteristic: {char_obj.uuid} ({char_obj.description}), Properties: {char_obj.properties}, Handle: {char_obj.handle}")
 				raise BleakError(f"Control Characteristic {CONTROL_CHARACTERISTIC_UUID} not found.")
 			# --- End logging properties ---
 
