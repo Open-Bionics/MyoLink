@@ -135,7 +135,7 @@ class ParsedAdvertisingData:
 
 # --- Parsing Function ---
 
-def parse_advertisement_data(ad_data: AdvertisementData) -> ParsedAdvertisingData | None:
+def parse_advertisement_data(ad_data: AdvertisementData) -> Optional[ParsedAdvertisingData]:
     """Parses Open Bionics specific advertising data.
 
     Args:
