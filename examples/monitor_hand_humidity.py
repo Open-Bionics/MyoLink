@@ -164,6 +164,15 @@ class HumidityMonitor:
 				logger.warning("Timeout explicitly caught from get_relative_humidity in periodic task.")
 			except BleakError as e:
 				logger.error(f"BleakError while getting humidity via Hand class: {e}")
+			except HandCommandError as e: # Catch HandCommandError from the Hand class
+				logger.error(f"HandCommandError while getting humidity: {e}")
+			except Exception as e: # Catch any other unexpected errors
+				logger.error(f"Unexpected error in _read_humidity_periodically: {e}", exc_info=True)
+				# self._monitoring_active = False # Optionally stop monitoring
+				# break
+			
+			if not self._monitoring_active: # Check if an error handler set this (if uncommented above)
+			    break
 
 			await asyncio.sleep(READ_INTERVAL_SECONDS)
 

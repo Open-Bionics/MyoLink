@@ -3,7 +3,7 @@
 import asyncio
 import struct
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any, Dict
 from enum import Enum
 
 from bleak import BleakClient
@@ -12,6 +12,32 @@ from bleak.exc import BleakError
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# --- Enums and Exceptions specific to Hand Control ---
+class ResponseStatus(Enum):
+	"""Status codes for command responses."""
+	SUCCESS = 0x00
+	ERR_INVALID_CMD = 0x01
+	ERR_INVALID_PARAM = 0x02
+	ERR_INVALID_DATA_LEN = 0x03
+	ERR_INVALID_DATA = 0x04
+	ERR_INTERNAL = 0x05
+	# Add other specific error codes as they are discovered/documented
+
+class HandCommandError(BleakError):
+	"""Custom exception for hand command failures."""
+	def __init__(self, message: str, status: Optional[ResponseStatus] = None, raw_response: Optional[bytes] = None):
+		super().__init__(message)
+		self.status = status
+		self.raw_response = raw_response
+
+	def __str__(self):
+		base_str = super().__str__()
+		if self.status:
+			base_str += f" (Status: {self.status.name})"
+		if self.raw_response:
+			base_str += f" (Raw: {self.raw_response.hex()})"
+		return base_str
 
 # Hand Service and Characteristic UUIDs
 CONTROL_SERVICE_UUID = "0B0B4000-FEED-DEAD-BEE5-0BE9B1091C50"
@@ -61,9 +87,11 @@ class Hand:
 		self._client = client
 		# Store address from client
 		self._address = client.address
-		self._humidity_future: Optional[asyncio.Future[float]] = None
+		# self._humidity_future: Optional[asyncio.Future[float]] = None # Replaced by _pending_command_futures
 		self._notification_registration_lock = asyncio.Lock()
 		self._notifications_started = False # To track if start_notify has been called successfully
+		# For a more generic command/response system:
+		self._pending_command_futures: Dict[int, asyncio.Future] = {} # Key: Command ID
 
 	@property
 	def address(self) -> str:
@@ -72,88 +100,78 @@ class Hand:
 
 	async def set_digit_positions(self, positions: dict[int, float]):
 		"""Sets the position of the specified digits (0.0 to 1.0).
-
-		Args:
-			positions: A dictionary mapping digit ID (0-4) to position (0.0-1.0).
-					   Example: {0: 0.5, 1: 0.2} sets thumb and index positions.
+		This is treated as a fire-and-forget command; no response is awaited.
 		"""
 		if not self._client.is_connected:
-			logger.error("Cannot send command: Not connected.")
-			return
+			logger.error(f"[{self.address}] Cannot send Set Digit Positions: Not connected.")
+			return # Or raise error
 
-		# Validate input dictionary
-		if not isinstance(positions, dict):
-			logger.error(f"Invalid positions format. Must be a dictionary. Received: {type(positions)}")
-			return
-		if not positions: # Check if dict is empty
-			logger.warning("set_digit_positions called with empty positions dictionary.")
-			return
-
-		# Start payload with the specific "Set Digit Positions" sub-byte (0x01)
-		payload = bytearray([0x01])
+		if not isinstance(positions, dict) or not positions:
+			logger.error(f"[{self.address}] Invalid/empty positions for Set Digit Positions: {positions}")
+			return # Or raise error
+		
+		payload_data = bytearray([0x01]) # Specific sub-byte for CMD_SET_DIGIT_POSITIONS command type
 		num_digits_set = 0
-		for digit_id, pos in positions.items():
+		for digit_id, pos_val in positions.items():
 			if digit_id not in DIGIT_IDS:
-				logger.error(f"Invalid digit ID {digit_id} provided. Aborting command.")
-				return
-			if not isinstance(pos, (float, int)):
-				logger.error(f"Invalid position type for digit {digit_id}: {type(pos)}. Aborting command.")
-				return
+				logger.error(f"[{self.address}] Invalid digit ID {digit_id}. Aborting Set Digit Positions.")
+				return # Or raise
+			if not isinstance(pos_val, (float, int)):
+				logger.error(f"[{self.address}] Invalid position type for digit {digit_id}: {type(pos_val)}. Aborting.")
+				return # Or raise
 
-			clamped_pos = max(0.0, min(1.0, float(pos)))
-			# Append digit ID (1 byte) and position (4 bytes)
-			payload.append(digit_id)
-			payload.extend(struct.pack(">f", clamped_pos))
+			clamped_pos = max(0.0, min(1.0, float(pos_val)))
+			payload_data.append(digit_id)
+			payload_data.extend(struct.pack(">f", clamped_pos)) # Big-endian float for position
 			num_digits_set += 1
 
 		if num_digits_set == 0:
-			logger.error("No valid digit positions provided in the dictionary.")
-			return
+			logger.error(f"[{self.address}] No valid digit positions provided.")
+			return # Or raise
 
-		# Data length is the length of the entire payload (0x01 byte + N * (ID + float))
-		data_length = len(payload)
-		command = struct.pack(">BBBB", SCHEMA_VERSION, CMD_SET_DIGIT_POSITIONS, 0x01, data_length) + payload
+		# Command Structure: Schema | Command ID | Control Byte (IsRequest=1) | Data Length | Payload
+		control_byte_request = 0x01 # IsRequest = 1
+		data_length = len(payload_data)
+		command_packet = struct.pack(">BBBB", SCHEMA_VERSION, CMD_SET_DIGIT_POSITIONS, control_byte_request, data_length) + payload_data
 
-		logger.debug(f"Sending Set Digit Positions command: {command.hex()}")
 		try:
-			await self._client.write_gatt_char(CONTROL_CHARACTERISTIC_UUID, command, response=False)
-			logger.info(f"Sent Set Digit Positions command to {self.address}")
+			logger.info(f"[{self.address}] Sending Set Digit Positions (CMD 0x{CMD_SET_DIGIT_POSITIONS:02X}, Fire-and-forget): {command_packet.hex()}")
+			await self._client.write_gatt_char(CONTROL_CHARACTERISTIC_UUID, command_packet, response=False)
+			logger.debug(f"[{self.address}] Set Digit Positions command sent.")
 		except BleakError as e:
-			logger.error(f"Failed to send command: {e}")
+			logger.error(f"[{self.address}] BleakError during Set Digit Positions: {e}")
+			# Optionally re-raise or handle as appropriate for a fire-and-forget failure
 		except Exception as e:
-			logger.error(f"An unexpected error occurred while sending command: {e}")
+			logger.error(f"[{self.address}] Unexpected error during Set Digit Positions: {e}", exc_info=True)
 
 	async def set_grip(self, grip: GripType):
 		"""Sets the hand to a predefined grip.
-
-		Args:
-			grip: The GripType enum value representing the desired grip.
+		This is treated as a fire-and-forget command; no response is awaited.
 		"""
 		if not self._client.is_connected:
-			logger.error("Cannot send command: Not connected.")
-			return
+			logger.error(f"[{self.address}] Cannot send Set Grip: Not connected.")
+			return # Or raise
 
 		if not isinstance(grip, GripType):
-			logger.error(f"Invalid grip type: {grip}. Must be a GripType enum member.")
-			return
+			logger.error(f"[{self.address}] Invalid grip type: {grip}. Must be a GripType enum member.")
+			return # Or raise
 
-		# Payload for Set Grip (Schema 0) is just the grip ID byte
-		grip_id = grip.value
-		payload = bytes([grip_id])
-		data_length = len(payload)
+		grip_id_byte = grip.value
+		request_payload = bytes([grip_id_byte])
 
-		# Construct final command
-		# Schema | Command ID | Is Request | Data Length | Payload
-		command = struct.pack(">BBBB", SCHEMA_VERSION, CMD_SET_GRIP, 0x01, data_length) + payload
+		# Command Structure: Schema | Command ID | Control Byte (IsRequest=1) | Data Length | Payload
+		control_byte_request = 0x01 # IsRequest = 1
+		data_length = len(request_payload)
+		command_packet = struct.pack(">BBBB", SCHEMA_VERSION, CMD_SET_GRIP, control_byte_request, data_length) + request_payload
 
-		logger.debug(f"Sending Set Grip command: {command.hex()}")
 		try:
-			await self._client.write_gatt_char(CONTROL_CHARACTERISTIC_UUID, command, response=False)
-			logger.info(f"Sent Set Grip ({grip.name}) command to {self.address}")
+			logger.info(f"[{self.address}] Sending Set Grip (CMD 0x{CMD_SET_GRIP:02X}, Fire-and-forget): {command_packet.hex()}")
+			await self._client.write_gatt_char(CONTROL_CHARACTERISTIC_UUID, command_packet, response=False)
+			logger.debug(f"[{self.address}] Set Grip ({grip.name}) command sent.")
 		except BleakError as e:
-			logger.error(f"Failed to send command: {e}")
+			logger.error(f"[{self.address}] BleakError during Set Grip: {e}")
 		except Exception as e:
-			logger.error(f"An unexpected error occurred while sending command: {e}")
+			logger.error(f"[{self.address}] Unexpected error during Set Grip: {e}", exc_info=True)
 
 	async def _ensure_notifications_started(self):
 		"""Ensures that notifications are started on the control characteristic.
@@ -212,138 +230,165 @@ class Hand:
 	def _control_notification_handler(self, sender_handle: int, data: bytearray):
 		"""
 		Handles notifications from the CONTROL_CHARACTERISTIC_UUID.
-		It tries to parse incoming data as humidity if a request is pending.
+		It tries to parse incoming data based on pending command futures.
 		"""
-		logger.info(f"[{self.address}] RX NOTIFY RAW (Handle: {sender_handle}, Char: {CONTROL_CHARACTERISTIC_UUID}): {data.hex()} (Length: {len(data)})")
+		logger.info(f"[{self.address}] RX NOTIFY RAW (H: {sender_handle}, C: {CONTROL_CHARACTERISTIC_UUID.split('-')[0]}...): {data.hex()} (Len: {len(data)})")
 
-		# Check if there's an active future waiting for humidity data
-		active_future = self._humidity_future
-		if active_future and not active_future.done():
-			# Expected response format for Get Relative Humidity (0x0A):
-			# Byte 0: Schema Version
-			# Byte 1: Command ID (0x0A)
-			# Byte 2: Command Status (0x00 for success)
-			# Byte 3: Data Length (0x04)
-			# Bytes 4-7: Relative Humidity (float)
-			# Total expected length = 8 bytes
-			
-			if len(data) >= 8: # Minimum length for the full expected response
-				schema_ver, cmd_id_resp, status, length = data[0:4]
-				
-				if cmd_id_resp == CMD_GET_RELATIVE_HUMIDITY:
-					logger.info(f"[{self.address}] Notification matches Humidity CMD ID (0x{cmd_id_resp:02X}). Status: 0x{status:02X}, Declared Length: {length}")
-					if status == 0x00: # Assuming 0x00 is success
-						if length == 0x04:
-							try:
-								# Unpack the float from bytes 4-7
-								humidity_value = struct.unpack(">f", data[4:8])[0] # Big-endian float
-								logger.info(f"[{self.address}] Parsed humidity from 8-byte notification (big-endian): {humidity_value:.2f}%")
-								active_future.set_result(humidity_value)
-							except struct.error as e:
-								logger.error(f"[{self.address}] Failed to unpack 4-byte float from humidity response: {e}. Data payload: {data[4:8].hex()}")
-								active_future.set_exception(ValueError(f"Invalid humidity data float format: {data[4:8].hex()}"))
-							except Exception as e: # Catch any other errors during unpacking/set_result
-								logger.error(f"[{self.address}] Error processing humidity data: {e}")
-								if not active_future.done(): # Check again as set_exception could be called by another path
-									active_future.set_exception(e)
-						else:
-							logger.warning(f"[{self.address}] Humidity response success status, but unexpected data length: {length}. Expected 4.")
-							# active_future.set_exception(ValueError(f"Humidity response unexpected data length {length}"))
-					else:
-						logger.error(f"[{self.address}] Humidity command 0x{cmd_id_resp:02X} failed with status 0x{status:02X}. Full response: {data.hex()}")
-						active_future.set_exception(RuntimeError(f"Humidity command failed with status 0x{status:02X}"))
-				# else:
-				# This notification is not for CMD_GET_RELATIVE_HUMIDITY, even if a humidity future is pending.
-				# Could be a response to a different command that was interleaved, or an unsolicited status.
-				# logger.debug(f"[{self.address}] Notification is not a humidity response (CMD ID mismatch). CMD_ID: 0x{cmd_id_resp:02X}")
+		if len(data) < 4: # Minimum length for Schema, CMD_ID, Status, Data_Length
+			logger.warning(f"[{self.address}] Notification too short to parse header (Len: {len(data)}). Data: {data.hex()}")
+			return
 
-			elif len(data) == 4: # Previous assumption, now less likely for humidity but good to log if it happens
-				logger.warning(f"[{self.address}] Received 4-byte notification while humidity future pending. Data: {data.hex()}. This is not the expected 8-byte format.")
-				# If this were a valid but different command's response, we might handle it.
-				# For humidity, this is unexpected according to the new format.
-				# To avoid stalling the future indefinitely on an unexpected short packet,
-				# we might set an exception if no other longer packet arrives.
-				# However, the timeout on `wait_for` in `get_relative_humidity` will handle this.
+		schema_ver, cmd_id_resp, status_byte, data_len_resp = data[0:4]
+		response_payload = data[4:] # This will be empty if data_len_resp is 0 and len(data) is 4
 
-			# else: (len(data) < 4 or other lengths not matching 8 or 4)
-				# logger.debug(f"[{self.address}] Notification for active humidity future had unexpected length {len(data)}. Data: {data.hex()}. Expected 8 bytes for humidity response.")
-				# The main timeout in get_relative_humidity will handle cases of no valid packet.
-		else:
-			# No active humidity future, or it's already resolved.
-			# This could be an unsolicited notification or a response for a different, future mechanism.
-			logger.debug(f"[{self.address}] Received notification, but no pending humidity future or it was already resolved: {data.hex()}")
+		# Validate actual payload length against declared data_len_resp
+		if len(response_payload) != data_len_resp:
+			logger.warning(f"[{self.address}] Payload length mismatch for CMD 0x{cmd_id_resp:02X}. Declared: {data_len_resp}, Actual: {len(response_payload)}. Full data: {data.hex()}")
+			# We might still proceed if the future handler for this cmd_id knows how to deal with it,
+			# or we could early exit / set a generic error on a future if one is found.
+
+		try:
+			# Bit 7 is IsRequest (0 for response), Bits 0-2 are Response Status
+			is_response_type = not (status_byte & 0x80) # 0 if response, 1 if request
+			raw_status_bits = status_byte & 0x07 # Extract bits 0-2
+			response_status = ResponseStatus(raw_status_bits)
+		except ValueError:
+			logger.error(f"[{self.address}] Unknown ResponseStatus value {raw_status_bits} from status byte 0x{status_byte:02X} for CMD 0x{cmd_id_resp:02X}.")
+			# Find a future for this cmd_id_resp and set an error, because we can't proceed with an unknown status.
+			unknown_status_future = self._pending_command_futures.get(cmd_id_resp)
+			if unknown_status_future and not unknown_status_future.done():
+				unknown_status_future.set_exception(HandCommandError(f"Unknown response status {raw_status_bits}", status=None, raw_response=data))
+			return
+
+		if not is_response_type:
+			logger.warning(f"[{self.address}] Received notification that is marked as a 'request' (not a response) for CMD 0x{cmd_id_resp:02X}. Status byte: 0x{status_byte:02X}. Ignoring.")
+			return
+
+		logger.debug(f"[{self.address}] Parsed Notification: CMD_ID=0x{cmd_id_resp:02X}, StatusByte=0x{status_byte:02X} (IsResp={is_response_type}, Status={response_status.name}), DeclaredLen={data_len_resp}, PayloadLen={len(response_payload)}")
+
+		# --- Process based on Command ID --- 
+		future_for_cmd = self._pending_command_futures.get(cmd_id_resp)
+
+		if not future_for_cmd or future_for_cmd.done():
+			logger.warning(f"[{self.address}] Received response for CMD 0x{cmd_id_resp:02X}, but no pending/active future found or future already done. Status: {response_status.name}. Data: {data.hex()}")
+			return
+
+		# At this point, we have an active future for this cmd_id_resp
+		if cmd_id_resp == CMD_GET_RELATIVE_HUMIDITY:
+			if response_status == ResponseStatus.SUCCESS:
+				if data_len_resp == 4 and len(response_payload) >= 4:
+					try:
+						humidity_value = struct.unpack(">f", response_payload[:4])[0]
+						logger.info(f"[{self.address}] Parsed humidity: {humidity_value:.2f}% for CMD 0x{cmd_id_resp:02X}")
+						future_for_cmd.set_result(humidity_value)
+					except struct.error as e:
+						logger.error(f"[{self.address}] Failed to unpack float for CMD 0x{cmd_id_resp:02X}: {e}. Payload: {response_payload[:4].hex()}")
+						future_for_cmd.set_exception(HandCommandError(f"Invalid float format for humidity: {response_payload[:4].hex()}", status=response_status, raw_response=data))
+				else:
+					logger.warning(f"[{self.address}] Humidity CMD 0x{cmd_id_resp:02X} success, but data length mismatch. Declared: {data_len_resp}, Payload: {len(response_payload)}. Expected 4 data bytes.")
+					future_for_cmd.set_exception(HandCommandError(f"Humidity success but data length mismatch (declared {data_len_resp}, payload {len(response_payload)}, expected 4)", status=response_status, raw_response=data))
+			else: # Error status for humidity command
+				logger.error(f"[{self.address}] Humidity CMD 0x{cmd_id_resp:02X} failed with status {response_status.name} (StatusByte: 0x{status_byte:02X}).")
+				future_for_cmd.set_exception(HandCommandError(f"Humidity command failed: {response_status.name}", status=response_status, raw_response=data))
+		
+		# --- Generalized handling for other command responses ---
+		else: # For commands other than CMD_GET_RELATIVE_HUMIDITY
+			if response_status == ResponseStatus.SUCCESS:
+				# For commands that only return status, payload might be empty (data_len_resp == 0)
+				# Or they might return some data. The future's result type will depend on the command.
+				# We've already logged a warning if data_len_resp != len(response_payload)
+				logger.info(f"[{self.address}] Command 0x{cmd_id_resp:02X} successful. Status: {response_status.name}. Payload: {response_payload.hex()}")
+				future_for_cmd.set_result(response_payload if data_len_resp > 0 else True)
+			else: # Error status for this other command
+				logger.error(f"[{self.address}] Command 0x{cmd_id_resp:02X} failed with status {response_status.name} (StatusByte: 0x{status_byte:02X}).")
+				future_for_cmd.set_exception(HandCommandError(f"Command 0x{cmd_id_resp:02X} failed: {response_status.name}", status=response_status, raw_response=data))
+
+	async def _send_command_and_process_response(
+		self, 
+		command_id: int,
+		request_payload: bytes,
+		# expected_response_cmd_id: int, # Usually same as command_id for direct responses
+		# expected_response_data_len: Optional[int] = 0, # None if variable, 0 if only status
+		timeout: float = 5.0
+	) -> Any: # Return type depends on command, could be bool, bytes, float, etc.
+		"""
+		Internal helper to send a command and await its specific response notification.
+		The _control_notification_handler is responsible for parsing the header, 
+		checking status, and resolving the future associated with this command_id.
+		"""
+		if not self._client.is_connected:
+			logger.error(f"[{self.address}] Cannot send CMD 0x{command_id:02X}: Not connected.")
+			raise BleakError("Client not connected.")
+
+		await self._ensure_notifications_started() # Raises on failure
+
+		if self._pending_command_futures.get(command_id) and \
+		   not self._pending_command_futures[command_id].done():
+			logger.warning(f"[{self.address}] Request for CMD_ID 0x{command_id:02X} already in progress.")
+			# Or raise an error to prevent concurrent identical commands if not desired
+			raise HandCommandError(f"Command 0x{command_id:02X} already in progress.")
+
+		current_request_future = asyncio.Future()
+		self._pending_command_futures[command_id] = current_request_future
+
+		# Command Structure: Schema | Command ID | Control Byte (IsRequest=1) | Data Length | Payload
+		control_byte_request = 0x01 # IsRequest = 1
+		data_length = len(request_payload)
+		command_packet = struct.pack(">BBBB", SCHEMA_VERSION, command_id, control_byte_request, data_length) + request_payload
+		
+		try:
+			logger.info(f"[{self.address}] Sending CMD 0x{command_id:02X} (Ctrl:0x{control_byte_request:02X}, Len:{data_length}): {command_packet.hex()}")
+			await self._client.write_gatt_char(CONTROL_CHARACTERISTIC_UUID, command_packet, response=False)
+
+			# Wait for the _control_notification_handler to set the result of current_request_future
+			# The handler will parse the response specific to this command_id
+			response_data = await asyncio.wait_for(current_request_future, timeout=timeout)
+			return response_data # This will be what the handler's set_result() provided
+
+		except asyncio.TimeoutError:
+			logger.error(f"[{self.address}] Timeout ({timeout}s) waiting for response to CMD 0x{command_id:02X}.")
+			if not current_request_future.done(): # Should be done by timeout, but ensure
+				current_request_future.set_exception(HandCommandError(f"Timeout for CMD 0x{command_id:02X}", status=None))
+			raise HandCommandError(f"Timeout for CMD 0x{command_id:02X}", status=None) # Re-raise as HandCommandError
+		except BleakError as e: # Catch Bleak specific errors during write or notification issues
+			logger.error(f"[{self.address}] BleakError during CMD 0x{command_id:02X}: {e}")
+			if not current_request_future.done():
+				current_request_future.set_exception(HandCommandError(f"BleakError for CMD 0x{command_id:02X}: {e}", status=None))
+			raise HandCommandError(f"BleakError for CMD 0x{command_id:02X}: {e}", status=None) from e
+		except HandCommandError: # Re-raise HandCommandErrors (e.g. from notification handler)
+			raise
+		except Exception as e: # Catch other unexpected errors
+			logger.error(f"[{self.address}] Unexpected error during CMD 0x{command_id:02X}: {e}", exc_info=True)
+			if not current_request_future.done():
+				current_request_future.set_exception(HandCommandError(f"Unexpected error for CMD 0x{command_id:02X}: {e}", status=None))
+			raise HandCommandError(f"Unexpected error for CMD 0x{command_id:02X}: {e}", status=None) from e
+		finally:
+			if self._pending_command_futures.get(command_id) is current_request_future:
+				del self._pending_command_futures[command_id]
 
 	async def get_relative_humidity(self, timeout: float = 5.0) -> Optional[float]:
 		"""
 		Sends a command to the hand to get the relative humidity.
-
-		The response (a 32-bit float) is expected via a notification on the
-		CONTROL_CHARACTERISTIC_UUID.
-
-		Args:
-			timeout: Time in seconds to wait for the humidity data.
-
-		Returns:
-			The relative humidity as a float, or None if an error occurs or times out.
+		The response (a 32-bit float) is expected via a notification.
 		"""
-		if not self._client.is_connected:
-			logger.error(f"[{self.address}] Cannot get humidity: Not connected.")
-			return None
-
+		# For Get Relative Humidity: No request payload
+		request_payload = b''
 		try:
-			# Ensure notifications are started. This will raise an exception on failure.
-			await self._ensure_notifications_started()
-		except Exception as e:
-			logger.error(f"[{self.address}] Notification setup failed, cannot get humidity: {e}")
-			return None # Cannot proceed if notifications aren't working
-
-		# Check if a humidity request is already in progress
-		if self._humidity_future and not self._humidity_future.done():
-			logger.warning(f"[{self.address}] Humidity request already in progress. Please try again later.")
-			# Or raise asyncio.InvalidStateError("Humidity request already in progress")
+			# The _control_notification_handler will parse the float for CMD_GET_RELATIVE_HUMIDITY
+			# and set it as the result of the future.
+			humidity_value = await self._send_command_and_process_response(
+				command_id=CMD_GET_RELATIVE_HUMIDITY,
+				request_payload=request_payload,
+				timeout=timeout
+			)
+			if isinstance(humidity_value, float):
+				return humidity_value
+			else: # Should not happen if handler is correct for this CMD_ID
+				logger.error(f"[{self.address}] Get Relative Humidity returned unexpected type: {type(humidity_value)}. Value: {humidity_value}")
+				return None
+		except HandCommandError as e:
+			logger.error(f"[{self.address}] Failed to get relative humidity: {e}")
 			return None
-
-		# Create a new Future for this specific request
-		current_request_future = asyncio.Future()
-		self._humidity_future = current_request_future
-
-		# Command Structure: Schema | Command ID | Control Byte | Data Length | Payload
-		# For Get Relative Humidity:
-		#   Schema_Version (0x00)
-		#   CMD_GET_RELATIVE_HUMIDITY (0x0A)
-		#   Control Byte (assumed 0x01, similar to other commands for consistency)
-		#   Data Length (0x00 - no payload for this request)
-		control_byte = 0x01 # Changed back to 0x01 for testing with longer timeout
-		command = struct.pack(">BBBB", SCHEMA_VERSION, CMD_GET_RELATIVE_HUMIDITY, control_byte, 0x00)
-
-		try:
-			logger.info(f"[{self.address}] Sending 'Get Relative Humidity' (ID: 0x{CMD_GET_RELATIVE_HUMIDITY:02X}, Control: 0x{control_byte:02X}) command: {command.hex()}")
-			await self._client.write_gatt_char(CONTROL_CHARACTERISTIC_UUID, command, response=False)
-
-			# Wait for the notification handler to set the result of current_request_future
-			try:
-				humidity_value = await asyncio.wait_for(current_request_future, timeout=timeout)
-			except asyncio.TimeoutError: 
-				logger.error(f"[{self.address}] Timeout ({timeout}s) waiting for humidity data notification (asyncio.wait_for).")
-				if not current_request_future.done():
-					current_request_future.set_exception(asyncio.TimeoutError("Timeout waiting for humidity data (asyncio.wait_for)"))
-				return None 
-			
-			return humidity_value # Return the successfully awaited value
-
-		# Keep a general BleakError catch if write_gatt_char fails, or other Bleak issues
-		except BleakError as e:
-			logger.error(f"[{self.address}] BleakError during Get Relative Humidity command: {e}")
-			if not current_request_future.done():
-				current_request_future.set_exception(e)
-			return None
-		# Catch unexpected errors more broadly too
-		except Exception as e:
-			logger.error(f"[{self.address}] Unexpected error in get_relative_humidity: {e}", exc_info=True)
-			if not current_request_future.done():
-				current_request_future.set_exception(e)
-			return None
-		finally:
-			# Clean up: if self._humidity_future is still pointing to the future for *this* call, clear it.
-			if self._humidity_future is current_request_future:
-				self._humidity_future = None 
+		except Exception as e: # Catch any other unexpected errors from the call
+			logger.error(f"[{self.address}] Unexpected exception when getting humidity: {e}", exc_info=True)
+			return None 
