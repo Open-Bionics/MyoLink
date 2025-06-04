@@ -1,12 +1,17 @@
 import asyncio
 import logging
 import time
+import sys # Added for sys.path modification
+import os # Added for sys.path modification
+
+# Add project root to path if running script directly
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from bleak import BleakScanner, BleakClient
 
 # Import discovery elements
 from myolink.discovery import parse_advertisement_data, DeviceType
-from myolink.hand import Hand, GripType, HAND_SERVICE_UUID
+from myolink.device.hand import Hand, GripType
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -61,7 +66,7 @@ async def main():
 
         try:
             logger.info("Setting position for Thumb and Index finger...")
-            await hand.set_positions({0: 100, 1: 80}) # Thumb rotation=100%, Index flexion=80%
+            await hand.set_digit_positions({0: 1.0, 1: 0.8}) # Thumb rotation=100% (1.0), Index flexion=80% (0.8)
             await asyncio.sleep(2)
 
             logger.info("Executing Point grip...")
@@ -69,7 +74,7 @@ async def main():
             await asyncio.sleep(3)
 
             logger.info("Setting all digits to 20%...")
-            await hand.set_positions({0: 20, 1: 20, 2: 20, 3: 20, 4: 20})
+            await hand.set_digit_positions({0: 0.2, 1: 0.2, 2: 0.2, 3: 0.2, 4: 0.2}) # All digits to 0.2 (20%)
             await asyncio.sleep(2)
 
             logger.info("Executing Relax grip...")
