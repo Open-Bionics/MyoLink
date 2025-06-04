@@ -293,7 +293,7 @@ class Hand:
 					try:
 						humidity_value = struct.unpack(">f", response_payload[:4])[0]
 						if math.isnan(humidity_value) or math.isinf(humidity_value):
-							logger.error(f"[{self.address}] Received invalid humidity float ({humidity_value}) for CMD 0x{cmd_id_resp:02X}. Payload: {response_payload[:4].hex()}")
+							logger.error(f"[{self.address}] Received invalid humidity float value ({humidity_value}) for CMD 0x{cmd_id_resp:02X}. Payload: {response_payload[:4].hex()}")
 							future_for_cmd.set_exception(HandCommandError(f"Received invalid humidity float value: {humidity_value}", status=response_status, raw_response=data))
 						else:
 							logger.info(f"[{self.address}] Parsed humidity: {humidity_value:.2f}% for CMD 0x{cmd_id_resp:02X}")

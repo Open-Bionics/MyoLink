@@ -598,3 +598,167 @@ async def test_NotificationHandler_ShouldSetException_ForUnknownResponseStatus(h
 
 	if cmd_id in hand_instance._pending_command_futures:
 		del hand_instance._pending_command_futures[cmd_id]
+
+@pytest.mark.asyncio
+async def test_NotificationHandler_ShouldSetResultWithTuple_ForSuccessfulHumidityTempResponse(hand_instance):
+	"""Verify handler sets result with (humidity, temperature) tuple for 8-byte response."""
+	# Simulate a successful humidity and temperature notification (8 bytes payload)
+	humidity_value = 55.5
+	temperature_value = 22.3
+	humidity_bytes = struct.pack(">f", humidity_value)
+	temperature_bytes = struct.pack(">f", temperature_value)
+	payload = humidity_bytes + temperature_bytes
+	# Header: Schema | CMD_ID | Status (Success=0, IsRequest=0) | Length
+	header = struct.pack(">BBBB", SCHEMA_VERSION, CMD_GET_RELATIVE_HUMIDITY, 0x00, len(payload))
+	simulated_data = bytearray(header + payload)
+	sender_handle = 33 # Dummy handle
+
+	# Create and register a future
+	humidity_temp_future = asyncio.Future()
+	hand_instance._pending_command_futures[CMD_GET_RELATIVE_HUMIDITY] = humidity_temp_future
+
+	with patch('myolink.device.hand.logger') as mock_logger:
+		# Call the handler
+		hand_instance._control_notification_handler(sender_handle, simulated_data)
+
+	# Assert the future is done and has the correct result (tuple)
+	assert humidity_temp_future.done(), "Humidity/Temperature future should be done."
+	assert not humidity_temp_future.cancelled(), "Humidity/Temperature future should not be cancelled."
+	assert humidity_temp_future.exception() is None, f"Humidity/Temperature future should not have an exception, but got {humidity_temp_future.exception()}."
+	result = humidity_temp_future.result()
+	assert isinstance(result, tuple), "Result should be a tuple."
+	assert len(result) == 2, "Result tuple should have two elements."
+	assert isinstance(result[0], float), "First element should be float (humidity)."
+	assert isinstance(result[1], float), "Second element should be float (temperature)."
+	assert result[0] == pytest.approx(humidity_value), "Humidity value should match."
+	assert result[1] == pytest.approx(temperature_value), "Temperature value should match."
+
+	# Check log message
+	mock_logger.info.assert_any_call(
+		f"[{hand_instance.address}] Parsed humidity: {humidity_value:.2f}%, Temperature: {temperature_value:.2f}°C for CMD 0x{CMD_GET_RELATIVE_HUMIDITY:02X}"
+	)
+
+
+@pytest.mark.asyncio
+async def test_NotificationHandler_ShouldSetException_ForHumidityTempInvalidFloatData(hand_instance):
+	"""Verify handler sets exception for 8-byte response with invalid float data."""
+	# Simulate an 8-byte successful response with invalid float bytes (e.g., NaN for temp)
+	humidity_value = 55.5
+	invalid_temp_bytes = b'\x7f\xc0\x00\x00' # NaN float bytes
+	humidity_bytes = struct.pack(">f", humidity_value)
+	payload = humidity_bytes + invalid_temp_bytes
+	# Header: Schema | CMD_ID | Status (Success=0, IsRequest=0) | Length
+	header = struct.pack(">BBBB", SCHEMA_VERSION, CMD_GET_RELATIVE_HUMIDITY, 0x00, len(payload))
+	simulated_data = bytearray(header + payload)
+	sender_handle = 33 # Dummy handle
+
+	# Create and register a future
+	humidity_temp_future = asyncio.Future()
+	hand_instance._pending_command_futures[CMD_GET_RELATIVE_HUMIDITY] = humidity_temp_future
+
+	with patch('myolink.device.hand.logger') as mock_logger:
+		# Call the handler
+		hand_instance._control_notification_handler(sender_handle, simulated_data)
+
+	# Assert the future is done and has a HandCommandError exception
+	assert humidity_temp_future.done(), "Humidity/Temperature future should be done after invalid float data notification."
+	assert not humidity_temp_future.cancelled(), "Humidity/Temperature future should not be cancelled."
+	assert humidity_temp_future.exception() is not None, "Humidity/Temperature future should have an exception."
+	assert isinstance(humidity_temp_future.exception(), HandCommandError), "Exception should be HandCommandError."
+	assert "Received invalid humidity/temperature float values" in str(humidity_temp_future.exception()), "Error message should mention invalid float values."
+
+	# Check for error log about invalid float values
+	mock_logger.error.assert_any_call(
+		f"[{hand_instance.address}] Received invalid humidity/temperature float values for CMD 0x{CMD_GET_RELATIVE_HUMIDITY:02X}. Payload: {payload.hex()}"
+	)
+
+
+@pytest.mark.asyncio
+async def test_GetTemperature_ShouldSendCorrectCommandAndReturnTemperature(hand_instance, mock_bleak_client):
+	"""Verify get_temperature sends the correct command and returns temperature from 8-byte response."""
+	# Expected command is the same as get_relative_humidity
+	control_byte_request = 0x01
+	data_length = 0x00
+	expected_command_packet = struct.pack(">BBBB", SCHEMA_VERSION, CMD_GET_RELATIVE_HUMIDITY, control_byte_request, data_length)
+
+	# Simulate the _send_command_and_process_response returning an 8-byte response tuple
+	humidity_value = 60.0
+	temperature_value = 25.0
+	simulated_result = (humidity_value, temperature_value)
+
+	# Patch _send_command_and_process_response to return the simulated result
+	with patch.object(hand_instance, '_send_command_and_process_response', new_callable=AsyncMock) as mock_send_command: # Removed mock_ensure_notify
+
+		mock_send_command.return_value = simulated_result
+
+		# Call get_temperature
+		temperature = await hand_instance.get_temperature(timeout=1.0)
+
+		# Assert _send_command_and_process_response was called with correct arguments
+		mock_send_command.assert_awaited_once_with(
+			command_id=CMD_GET_RELATIVE_HUMIDITY,
+			request_payload=b'',
+			timeout=1.0
+		)
+
+		# Assert the correct temperature was returned
+		assert temperature == pytest.approx(temperature_value), "get_temperature should return the correct temperature."
+
+
+@pytest.mark.asyncio
+async def test_GetTemperature_ShouldReturnNone_For4ByteResponse(hand_instance, mock_bleak_client):
+	"""Verify get_temperature returns None when handler provides 4-byte (humidity only) response."""
+	# Simulate the _send_command_and_process_response returning a 4-byte response (float)
+	humidity_value = 60.0
+	simulated_result = humidity_value
+
+	# Patch _send_command_and_process_response to return the simulated result
+	with patch.object(hand_instance, '_send_command_and_process_response', new_callable=AsyncMock) as mock_send_command, \
+		 patch('myolink.device.hand.logger') as mock_logger: # Removed mock_ensure_notify
+
+		mock_send_command.return_value = simulated_result
+
+		# Call get_temperature
+		temperature = await hand_instance.get_temperature(timeout=1.0)
+
+		# Assert _send_command_and_process_response was called correctly
+		mock_send_command.assert_awaited_once_with(
+			command_id=CMD_GET_RELATIVE_HUMIDITY,
+			request_payload=b'',
+			timeout=1.0
+		)
+
+		# Assert None was returned
+		assert temperature is None, "get_temperature should return None for 4-byte response."
+
+		# Check for the warning log
+		mock_logger.warning.assert_any_call(
+			f"[{hand_instance.address}] Received humidity only response (4 bytes), temperature not available."
+		)
+
+
+@pytest.mark.asyncio
+async def test_GetRelativeHumidity_ShouldReturnHumidityFrom8ByteResponse(hand_instance, mock_bleak_client):
+	"""Verify get_relative_humidity returns humidity from an 8-byte response tuple."""
+	# Simulate the _send_command_and_process_response returning an 8-byte response tuple
+	humidity_value = 65.0
+	temperature_value = 23.5
+	simulated_result = (humidity_value, temperature_value)
+
+	# Patch _send_command_and_process_response to return the simulated result
+	with patch.object(hand_instance, '_send_command_and_process_response', new_callable=AsyncMock) as mock_send_command: # Removed mock_ensure_notify
+
+		mock_send_command.return_value = simulated_result
+
+		# Call get_relative_humidity
+		humidity = await hand_instance.get_relative_humidity(timeout=1.0)
+
+		# Assert _send_command_and_process_response was called correctly
+		mock_send_command.assert_awaited_once_with(
+			command_id=CMD_GET_RELATIVE_HUMIDITY,
+			request_payload=b'',
+			timeout=1.0
+		)
+
+		# Assert the correct humidity was returned
+		assert humidity == pytest.approx(humidity_value), "get_relative_humidity should return the humidity from an 8-byte response."
