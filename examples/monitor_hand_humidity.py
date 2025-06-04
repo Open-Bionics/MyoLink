@@ -37,7 +37,7 @@ except ImportError:
 # These are no longer needed as the Hand class handles this internally via control commands
 
 READ_INTERVAL_SECONDS = 1.0  # How often to read humidity
-PLOT_MAX_POINTS = 300       # Maximum number of data points to display on the plot
+PLOT_MAX_POINTS = 1800       # Maximum number of data points to display on the plot
 CSV_OUTPUT_DIR = "humidity_readings" # Directory to save CSV files
 
 # --- Logging Configuration ---
@@ -51,6 +51,9 @@ plot_curve: Optional[pg.PlotDataItem] = None
 humidity_data: List[float] = []
 time_data: List[float] = []
 start_time_monotonic: float = 0.0 # Renamed for clarity
+# New globals for temperature
+plot_curve_temp: Optional[pg.PlotDataItem] = None
+temperature_data: List[float] = []
 
 # --- Plotting Functions (if pyqtgraph is available) ---
 app_instance = None # Global variable for QApplication
@@ -66,6 +69,7 @@ def ensure_qapp():
 
 def setup_plot():
 	global plot_widget, plot_curve, humidity_data, time_data, start_time_monotonic
+	global plot_curve_temp, temperature_data # Added temperature globals
 
 	if not PYQTGRAPH_AVAILABLE:
 		logger.warning("Plotting is disabled as pyqtgraph/PyQt5 is not available.")
@@ -74,38 +78,46 @@ def setup_plot():
 	ensure_qapp() # Ensure QApplication exists
 
 	plot_widget = pg.PlotWidget()
-	plot_widget.setWindowTitle('Live Hand Humidity')
-	plot_widget.setLabel('left', 'Relative Humidity (%)')
+	plot_widget.setWindowTitle('Live Hand Sensor Data')
+	# plot_widget.setLabel('left', 'Relative Humidity (%)') # More generic label now
+	plot_widget.setLabel('left', 'Sensor Value')
 	plot_widget.setLabel('bottom', 'Time (s)')
 	plot_widget.showGrid(x=True, y=True)
-	plot_curve = plot_widget.plot(pen='y') # Yellow line
+	plot_widget.addLegend() # Add legend for multiple plots
+
+	plot_curve = plot_widget.plot(pen='y', name='Humidity (%)') # Yellow line for humidity
+	plot_curve_temp = plot_widget.plot(pen='r', name='Temperature (°C)') # Red line for temperature
 
 	humidity_data = []
+	temperature_data = [] # Initialize temperature data list
 	time_data = []
 	start_time_monotonic = time.monotonic()
 
 	plot_widget.show()
 
 
-def update_plot(humidity_value: float):
-	global plot_widget, plot_curve, humidity_data, time_data
+def update_plot(humidity_value: Optional[float], temperature_value: Optional[float]):
+	global plot_widget, plot_curve, humidity_data, time_data, plot_curve_temp, temperature_data
 
-	if not PYQTGRAPH_AVAILABLE or plot_curve is None or plot_widget is None:
+	if not PYQTGRAPH_AVAILABLE or plot_curve is None or plot_curve_temp is None or plot_widget is None:
 		return
 
 	current_time_sec = time.monotonic() - start_time_monotonic
-	humidity_data.append(humidity_value)
+	
+	# Append humidity or NaN if None
+	humidity_data.append(humidity_value if humidity_value is not None else float('nan'))
+	# Append temperature or NaN if None
+	temperature_data.append(temperature_value if temperature_value is not None else float('nan'))
 	time_data.append(current_time_sec)
 
 	# Keep only the last PLOT_MAX_POINTS
-	if len(humidity_data) > PLOT_MAX_POINTS:
+	if len(time_data) > PLOT_MAX_POINTS: # Use time_data length as reference
 		humidity_data.pop(0)
+		temperature_data.pop(0)
 		time_data.pop(0)
 
 	plot_curve.setData(time_data, humidity_data)
-	# The QApplication event loop should handle updates. Explicit processEvents might be needed
-	# in some contexts, but with qasync, it's often managed.
-	# QtWidgets.QApplication.instance().processEvents()
+	plot_curve_temp.setData(time_data, temperature_data)
 
 
 class HumidityMonitor:
@@ -121,17 +133,18 @@ class HumidityMonitor:
 
 	async def _notification_handler(self, sender_handle: int, data: bytearray):
 		"""Handles incoming BLE notifications (if characteristic supports notify)."""
+		# This handler is primarily for humidity if direct characteristic notification is used.
+		# For temperature, we rely on the periodic read polling the Hand object.
+		humidity_value: Optional[float] = None
 		try:
 			# Standard Humidity characteristic is uint16, value is N * 0.01 percent
-			if len(data) == 2:
+			if len(data) == 2: # Assuming this is specific to a humidity characteristic
 				humidity_raw = struct.unpack("<H", data)[0] # uint16_t
 				humidity_value = float(humidity_raw) / 100.0 # Convert to percentage
 				logger.info(f"Received Humidity Notification: {humidity_value:.2f}%")
-				self._log_to_csv(humidity_value)
+				self._log_to_csv(humidity_value, None) # Log with None for temperature
 				if PYQTGRAPH_AVAILABLE:
-					# Call update_plot in a thread-safe way if qasync is not fully handling it
-					# For simplicity, direct call assuming qasync handles Qt event loop integration.
-					update_plot(humidity_value)
+					update_plot(humidity_value, None) # Update plot with None for temperature
 			else:
 				logger.warning(f"Received unexpected data length from humidity char: {len(data)} bytes, data: {data.hex()}")
 		except struct.error:
@@ -139,32 +152,57 @@ class HumidityMonitor:
 		except Exception as e:
 			logger.error(f"Error in notification handler: {e}")
 
-	async def _read_humidity_periodically(self):
-		"""Periodically reads the humidity characteristic."""
+	async def _read_sensor_data_periodically(self): # Renamed from _read_humidity_periodically
+		"""Periodically reads sensor data (humidity and temperature) characteristic."""
 		if self._client is None or not self._client.is_connected or self._hand_object is None:
-			logger.error("Client not connected or Hand object not initialised, cannot read humidity.")
+			logger.error("Client not connected or Hand object not initialised, cannot read sensor data.")
 			return
 
-		humidity_read_timeout = 4.5 # seconds, give ample time for device response
+		sensor_read_timeout = 4.5 # seconds, give ample time for device response
 		while self._monitoring_active and self._client.is_connected:
-			try:
-				logger.debug(f"Attempting to get relative humidity via Hand class (timeout: {humidity_read_timeout}s)...")
-				# Use the new method from the Hand class
-				humidity_value = await self._hand_object.get_relative_humidity(timeout=humidity_read_timeout)
+			humidity_value: Optional[float] = None
+			temperature_value: Optional[float] = None
 
+			# Read Humidity
+			try:
+				logger.debug(f"Attempting to get relative humidity via Hand class (timeout: {sensor_read_timeout}s)...")
+				humidity_value = await self._hand_object.get_relative_humidity(timeout=sensor_read_timeout)
 				if humidity_value is not None:
 					logger.info(f"Read Humidity: {humidity_value:.2f}%")
-					self._log_to_csv(humidity_value)
-					if PYQTGRAPH_AVAILABLE:
-						update_plot(humidity_value)
 				else:
 					logger.warning("Failed to get humidity or timed out (received None).")
-
 			except asyncio.TimeoutError:
 				logger.warning("Timeout explicitly caught from get_relative_humidity in periodic task.")
 			except BleakError as e:
 				logger.error(f"BleakError while getting humidity via Hand class: {e}")
+			except Exception as e: # Catch other unexpected errors for humidity
+				logger.error(f"Unexpected error getting humidity: {e}", exc_info=True)
 
+			# Read Temperature
+			try:
+				if hasattr(self._hand_object, 'get_temperature'):
+					logger.debug(f"Attempting to get temperature via Hand class (timeout: {sensor_read_timeout}s)...")
+					temperature_value = await self._hand_object.get_temperature(timeout=sensor_read_timeout) # Assumed method
+					if temperature_value is not None:
+						logger.info(f"Read Temperature: {temperature_value:.2f}°C")
+					else:
+						logger.warning("Failed to get temperature or timed out (received None).")
+				else:
+					logger.debug("Hand object does not have 'get_temperature' method. Skipping temperature reading.")
+			except asyncio.TimeoutError:
+				logger.warning("Timeout explicitly caught from get_temperature in periodic task.")
+			except BleakError as e:
+				logger.error(f"BleakError while getting temperature via Hand class: {e}")
+			except Exception as e: # Catch other unexpected errors for temperature
+				logger.error(f"Unexpected error getting temperature: {e}", exc_info=True)
+
+
+			# Log and Plot
+			if humidity_value is not None or temperature_value is not None: # Log if at least one value
+				self._log_to_csv(humidity_value, temperature_value)
+				if PYQTGRAPH_AVAILABLE:
+					update_plot(humidity_value, temperature_value)
+			
 			await asyncio.sleep(READ_INTERVAL_SECONDS)
 
 	def _setup_csv(self):
@@ -177,24 +215,26 @@ class HumidityMonitor:
 
 		timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 		hand_id_part = self._hand_device.address.replace(":", "").replace("-","") if self._hand_device else "unknown_hand"
-		filename = f"humidity_{hand_id_part}_{timestamp}.csv"
+		filename = f"sensor_data_{hand_id_part}_{timestamp}.csv" # Changed filename
 		filepath = os.path.join(CSV_OUTPUT_DIR, filename)
 		
 		try:
 			self._csv_file = open(filepath, 'w', newline='', encoding='utf-8')
 			self._csv_writer = csv.writer(self._csv_file)
-			self._csv_writer.writerow(['Timestamp', 'RelativeHumidity (%)']) 
-			logger.info(f"Saving humidity readings to: {filepath}")
+			self._csv_writer.writerow(['Timestamp', 'RelativeHumidity (%)', 'Temperature (°C)']) # Added Temperature column
+			logger.info(f"Saving sensor readings to: {filepath}")
 		except IOError as e:
 			logger.error(f"Failed to open CSV file {filepath}: {e}")
 			self._csv_file = None
 			self._csv_writer = None
 
-	def _log_to_csv(self, humidity_value: float):
+	def _log_to_csv(self, humidity_value: Optional[float], temperature_value: Optional[float]):
 		if self._csv_writer and self._csv_file:
 			try:
 				timestamp = datetime.datetime.now().isoformat()
-				self._csv_writer.writerow([timestamp, f"{humidity_value:.2f}"])
+				humidity_str = f"{humidity_value:.2f}" if humidity_value is not None else ""
+				temp_str = f"{temperature_value:.2f}" if temperature_value is not None else ""
+				self._csv_writer.writerow([timestamp, humidity_str, temp_str])
 				self._csv_file.flush() 
 			except IOError as e:
 				logger.error(f"Error writing to CSV: {e}")
@@ -271,9 +311,9 @@ class HumidityMonitor:
 			# 	logger.error(f"Characteristic {HUMIDITY_CHARACTERISTIC_UUID} does not support Notify or Read. Cannot monitor humidity.")
 			# 	self._monitoring_active = False
 			
-			# Start the periodic read task which now uses hand.get_relative_humidity()
-			logger.info("Starting periodic task to call hand.get_relative_humidity().")
-			self._read_task = asyncio.create_task(self._read_humidity_periodically())
+			# Start the periodic read task which now uses hand.get_relative_humidity() and hand.get_temperature()
+			logger.info("Starting periodic task to call sensor reading methods.")
+			self._read_task = asyncio.create_task(self._read_sensor_data_periodically()) # Updated method name
 
 
 			return True # Successfully connected and started monitoring (or attempted to)
