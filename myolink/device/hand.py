@@ -245,8 +245,6 @@ class Hand:
 		# Validate actual payload length against declared data_len_resp
 		if len(response_payload) != data_len_resp:
 			logger.warning(f"[{self.address}] Payload length mismatch for CMD 0x{cmd_id_resp:02X}. Declared: {data_len_resp}, Actual: {len(response_payload)}. Full data: {data.hex()}")
-			# We might still proceed if the future handler for this cmd_id knows how to deal with it,
-			# or we could early exit / set a generic error on a future if one is found.
 
 		try:
 			# Bit 7 is IsRequest (0 for response), Bits 0-2 are Response Status
@@ -255,10 +253,8 @@ class Hand:
 			response_status = ResponseStatus(raw_status_bits)
 		except ValueError as e: # Catch ValueError if raw_status_bits doesn't map to an enum member
 			logger.error(f"[{self.address}] Unknown ResponseStatus value {raw_status_bits} from status byte 0x{status_byte:02X} for CMD 0x{cmd_id_resp:02X}.")
-			# Find a future for this cmd_id_resp and set an error, because we can't proceed with an unknown status.
 			unknown_status_future = self._pending_command_futures.get(cmd_id_resp)
 			if unknown_status_future and not unknown_status_future.done():
-				# Set a HandCommandError with the ValueError as the cause
 				error_exception = HandCommandError(f"Unknown response status {raw_status_bits}", status=None, raw_response=data)
 				error_exception.__cause__ = e
 				unknown_status_future.set_exception(error_exception)
@@ -270,7 +266,7 @@ class Hand:
 
 		logger.debug(f"[{self.address}] Parsed Notification: CMD_ID=0x{cmd_id_resp:02X}, StatusByte=0x{status_byte:02X} (IsResp={is_response_type}, Status={response_status.name}), DeclaredLen={data_len_resp}, PayloadLen={len(response_payload)}")
 
-		# --- Process based on Command ID --- 
+		# --- Process based on Command ID ---
 		future_for_cmd = self._pending_command_futures.get(cmd_id_resp)
 
 		if not future_for_cmd or future_for_cmd.done():
@@ -280,66 +276,60 @@ class Hand:
 		# At this point, we have an active future for this cmd_id_resp
 
 		# --- Handle Payload Length Mismatch for Success Responses ---
-		# If status is success but the actual payload length doesn't match the declared length,
-		# it might indicate corrupted data. Handle this before command-specific parsing.
+		# If status is success but the actual payload length doesn't match the declared length, handle it.
 		if response_status == ResponseStatus.SUCCESS and len(response_payload) != data_len_resp:
-			# Exclude cases where data_len_resp is 0 (commands that expect no payload on success)
-			if data_len_resp > 0:
-				logger.warning(f"[{self.address}] Payload length mismatch on SUCCESS for CMD 0x{cmd_id_resp:02X}. Declared: {data_len_resp}, Actual: {len(response_payload)}. Data: {data.hex()}")
+			logger.warning(f"[{self.address}] Payload length mismatch on SUCCESS for CMD 0x{cmd_id_resp:02X}. Declared: {data_len_resp}, Actual: {len(response_payload)}. Data: {data.hex()}")
+			# Set exception unless declared length was 0 and payload is also 0 (valid empty payload)
+			if not (0 == data_len_resp and 0 == len(response_payload)):
 				future_for_cmd.set_exception(HandCommandError(
 					f"Payload length mismatch for CMD 0x{cmd_id_resp:02X} on success (declared {data_len_resp}, actual {len(response_payload)})",
 					status=response_status, raw_response=data))
 				return # Stop processing this notification further as an error occurred
-			# If data_len_resp is 0 and payload length is not 0, this is also a mismatch
-			elif data_len_resp == 0 and len(response_payload) > 0:
-				logger.warning(f"[{self.address}] Unexpected payload on SUCCESS for CMD 0x{cmd_id_resp:02X} which expected 0 data bytes. Actual payload len: {len(response_payload)}. Data: {data.hex()}")
-				future_for_cmd.set_exception(HandCommandError(
-					f"Unexpected payload received for CMD 0x{cmd_id_resp:02X} on success (expected 0 data bytes, got {len(response_payload)})",
-					status=response_status, raw_response=data))
-				return # Stop processing
 
-		# --- Process based on Command ID --- 
-		if cmd_id_resp == CMD_GET_RELATIVE_HUMIDITY:
-			if response_status == ResponseStatus.SUCCESS:
-				if data_len_resp == 4 and len(response_payload) >= 4:
+		# --- Process based on Command ID ---
+		if CMD_GET_RELATIVE_HUMIDITY == cmd_id_resp:
+			if ResponseStatus.SUCCESS == response_status:
+				if 4 == data_len_resp and len(response_payload) >= 4:
 					try:
 						humidity_value = struct.unpack(">f", response_payload[:4])[0]
-						# Check for invalid float values like NaN or infinity
 						if math.isnan(humidity_value) or math.isinf(humidity_value):
-							logger.error(f"[{self.address}] Received invalid humidity float value ({humidity_value}) for CMD 0x{cmd_id_resp:02X}. Payload: {response_payload[:4].hex()}")
+							logger.error(f"[{self.address}] Received invalid humidity float ({humidity_value}) for CMD 0x{cmd_id_resp:02X}. Payload: {response_payload[:4].hex()}")
 							future_for_cmd.set_exception(HandCommandError(f"Received invalid humidity float value: {humidity_value}", status=response_status, raw_response=data))
-							return # Add return here to exit after handling invalid float
 						else:
 							logger.info(f"[{self.address}] Parsed humidity: {humidity_value:.2f}% for CMD 0x{cmd_id_resp:02X}")
-							future_for_cmd.set_result(humidity_value)
+							future_for_cmd.set_result(humidity_value) # Set result as float
 					except struct.error as e:
 						logger.error(f"[{self.address}] Failed to unpack float for CMD 0x{cmd_id_resp:02X}: {e}. Payload: {response_payload[:4].hex()}")
-						# Corrected: Create exception first, then set cause.
 						float_unpack_error = HandCommandError(f"Invalid float format for humidity: {response_payload[:4].hex()}", status=response_status, raw_response=data)
 						float_unpack_error.__cause__ = e
 						future_for_cmd.set_exception(float_unpack_error)
-				else:
-					# This case should now be handled by the length mismatch check above, but keep as a safeguard
-					logger.warning(f"[{self.address}] Humidity CMD 0x{cmd_id_resp:02X} success, but data length mismatch based on internal logic. Declared: {data_len_resp}, Payload: {len(response_payload)}. Expected 4 data bytes.")
-					future_for_cmd.set_exception(HandCommandError(f"Humidity success but data length mismatch (declared {data_len_resp}, payload {len(response_payload)}, expected 4)", status=response_status, raw_response=data))
-			elif response_status != ResponseStatus.SUCCESS: # Error status for humidity command
+				elif 8 == data_len_resp and len(response_payload) >= 8: # Handle humidity and temperature
+					try:
+						humidity_value, temperature_value = struct.unpack(">ff", response_payload[:8]) # Unpack two floats
+						# Check for invalid float values
+						if math.isnan(humidity_value) or math.isinf(humidity_value) or \
+						   math.isnan(temperature_value) or math.isinf(temperature_value):
+							logger.error(f"[{self.address}] Received invalid humidity/temperature float values for CMD 0x{cmd_id_resp:02X}. Payload: {response_payload[:8].hex()}")
+							future_for_cmd.set_exception(HandCommandError(f"Received invalid humidity/temperature float values: ({humidity_value}, {temperature_value})", status=response_status, raw_response=data))
+						else:
+							logger.info(f"[{self.address}] Parsed humidity: {humidity_value:.2f}%, Temperature: {temperature_value:.2f}°C for CMD 0x{cmd_id_resp:02X}")
+							future_for_cmd.set_result((humidity_value, temperature_value)) # Set result as tuple
+					except struct.error as e:
+						logger.error(f"[{self.address}] Failed to unpack two floats for CMD 0x{cmd_id_resp:02X}: {e}. Payload: {response_payload[:8].hex()}")
+						float_unpack_error = HandCommandError(f"Invalid float format for humidity/temperature: {response_payload[:8].hex()}", status=response_status, raw_response=data)
+						float_unpack_error.__cause__ = e
+						future_for_cmd.set_exception(float_unpack_error)
+				else: # Success but unexpected data length (not 4 or 8)
+					logger.error(f"[{self.address}] Humidity CMD 0x{cmd_id_resp:02X} success but unexpected data length. Declared Len: {data_len_resp}, Actual Payload Len: {len(response_payload)}. Expected 4 or 8 data bytes for float(s).")
+					future_for_cmd.set_exception(HandCommandError(f"Humidity success but unexpected data structure (declared len {data_len_resp}, actual payload len {len(response_payload)})", status=response_status, raw_response=data))
+
+			elif ResponseStatus.SUCCESS != response_status: # Error status for humidity command
 				logger.error(f"[{self.address}] Humidity CMD 0x{cmd_id_resp:02X} failed with status {response_status.name} (StatusByte: 0x{status_byte:02X}).")
 				future_for_cmd.set_exception(HandCommandError(f"Humidity command failed: {response_status.name}", status=response_status, raw_response=data))
-			# If status is SUCCESS but payload length was 0 or other non-4 value (not handled by the primary check), it falls through here.
-			# We should probably treat a SUCCESS + non-4 payload as an error for humidity.
-			# The check 'if data_len_resp == 4 and len(response_payload) >= 4:' handles the valid case.
-			# If status is SUCCESS and that condition is NOT met, it implies a length issue not caught by the specific mismatch check (e.g. data_len_resp was not 4).
-			# Let's add an explicit error for SUCCESS with incorrect expected data length for humidity.
-			elif response_status == ResponseStatus.SUCCESS and (data_len_resp != 4 or len(response_payload) < 4):
-				logger.error(f"[{self.address}] Humidity CMD 0x{cmd_id_resp:02X} success but unexpected data structure. Declared Len: {data_len_resp}, Actual Payload Len: {len(response_payload)}. Expected 4 data bytes for float.")
-				future_for_cmd.set_exception(HandCommandError(f"Humidity success but unexpected data structure (declared len {data_len_resp}, actual payload len {len(response_payload)})", status=response_status, raw_response=data))
-		
+
 		# --- Generalized handling for other command responses ---
 		else: # For commands other than CMD_GET_RELATIVE_HUMIDITY
-			if response_status == ResponseStatus.SUCCESS:
-				# For commands that only return status, payload might be empty (data_len_resp == 0)
-				# Or they might return some data. The future's result type will depend on the command.
-				# We've already logged a warning if data_len_resp != len(response_payload)
+			if ResponseStatus.SUCCESS == response_status:
 				logger.info(f"[{self.address}] Command 0x{cmd_id_resp:02X} successful. Status: {response_status.name}. Payload: {response_payload.hex()}")
 				future_for_cmd.set_result(response_payload if data_len_resp > 0 else True)
 			else: # Error status for this other command
@@ -412,7 +402,9 @@ class Hand:
 	async def get_relative_humidity(self, timeout: float = 5.0) -> Optional[float]:
 		"""
 		Sends a command to the hand to get the relative humidity.
-		The response (a 32-bit float) is expected via a notification.
+		The response (a 32-bit float for humidity, or 64-bit for humidity+temp)
+		is expected via a notification.
+		Returns the humidity value.
 		"""
 		if not self._client.is_connected:
 			logger.error(f"[{self.address}] Cannot get humidity: Not connected.")
@@ -421,21 +413,63 @@ class Hand:
 		# For Get Relative Humidity: No request payload
 		request_payload = b''
 		try:
-			# The _control_notification_handler will parse the float for CMD_GET_RELATIVE_HUMIDITY
-			# and set it as the result of the future.
-			humidity_value = await self._send_command_and_process_response(
+			result = await self._send_command_and_process_response(
 				command_id=CMD_GET_RELATIVE_HUMIDITY,
 				request_payload=request_payload,
 				timeout=timeout
 			)
-			if isinstance(humidity_value, float):
-				return humidity_value
-			else: # Should not happen if handler is correct for this CMD_ID
-				logger.error(f"[{self.address}] Get Relative Humidity returned unexpected type: {type(humidity_value)}. Value: {humidity_value}")
+
+			if isinstance(result, tuple):
+				# Received humidity and temperature, return humidity
+				return result[0]
+			elif isinstance(result, float):
+				# Received only humidity
+				return result
+			else:
+				# Unexpected result type from handler
+				logger.error(f"[{self.address}] Get Relative Humidity received unexpected result type: {type(result)}. Value: {result}")
 				return None
 		except HandCommandError as e:
 			logger.error(f"[{self.address}] Failed to get relative humidity: {e}")
 			return None
 		except Exception as e: # Catch any other unexpected errors from the call
 			logger.error(f"[{self.address}] Unexpected exception when getting humidity: {e}", exc_info=True)
+			return None
+
+	async def get_temperature(self, timeout: float = 5.0) -> Optional[float]:
+		"""
+		Sends a command to the hand to get the relative humidity and temperature.
+		The response (64-bit for humidity+temp) is expected via a notification.
+		Returns the temperature value.
+		Note: This uses the same command as get_relative_humidity, but extracts
+		only the temperature from an 8-byte response.
+		"""
+		if not self._client.is_connected:
+			logger.error(f"[{self.address}] Cannot get temperature: Not connected.")
+			return None
+
+		request_payload = b''
+		try:
+			result = await self._send_command_and_process_response(
+				command_id=CMD_GET_RELATIVE_HUMIDITY,
+				request_payload=request_payload,
+				timeout=timeout
+			)
+
+			if isinstance(result, tuple) and len(result) == 2:
+				# Received humidity and temperature, return temperature
+				return result[1]
+			elif isinstance(result, float):
+				# Received only humidity (4-byte response), temperature is not available
+				logger.warning(f"[{self.address}] Received humidity only response (4 bytes), temperature not available.")
+				return None
+			else:
+				# Unexpected result type or tuple length from handler
+				logger.error(f"[{self.address}] Get Temperature received unexpected result type/value: {type(result)}. Value: {result}")
+				return None
+		except HandCommandError as e:
+			logger.error(f"[{self.address}] Failed to get temperature: {e}")
+			return None
+		except Exception as e: # Catch any other unexpected errors from the call
+			logger.error(f"[{self.address}] Unexpected exception when getting temperature: {e}", exc_info=True)
 			return None 
